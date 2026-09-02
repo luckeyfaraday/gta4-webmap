@@ -9,12 +9,24 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Program.cs" />
+    <Compile Include="PlayerExport.cs" />
+    <Compile Include="TextureIo.cs" />
     <Compile Include="HeadlessTextures.cs" />
     <Compile Include="UnityStubs.cs" />
     <Compile Include="..\converter\Assets\Scripts\RageLib\Common\**\*.cs" />
     <Compile Include="..\converter\Assets\Scripts\RageLib\FileSystem\Common\**\*.cs" />
     <Compile Include="..\converter\Assets\Scripts\RageLib\FileSystem\IMG\**\*.cs" />
     <Compile Include="..\converter\Assets\Scripts\RageLib\FileSystem\IMGFileSystem.cs" />
+    <Compile Include="..\converter\Assets\Scripts\RageLib\FileSystem\RPF\**\*.cs" />
+    <Compile Include="..\converter\Assets\Scripts\RageLib\FileSystem\RPFFileSystem.cs" />
+    <!-- Animation\AnimationClip.cs is deliberately excluded: it is the only file
+         in that folder that depends on Unity.Mathematics. -->
+    <Compile Include="..\converter\Assets\Scripts\RageLib\Animation\AnimationDictionaryFile.cs" />
+    <Compile Include="..\converter\Assets\Scripts\RageLib\Animation\AnimationData.cs" />
+    <Compile Include="..\converter\Assets\Scripts\RageLib\Animation\AnimTrack.cs" />
+    <Compile Include="..\converter\Assets\Scripts\RageLib\Animation\AnimChunk.cs" />
+    <Compile Include="..\converter\Assets\Scripts\RageLib\Animation\AnimChannel.cs" />
+    <Compile Include="..\converter\Assets\Scripts\RageLib\Animation\File.cs" />
     <Compile Include="..\converter\Assets\Scripts\RageLib\Models\IDataReader.cs" />
     <Compile Include="..\converter\Assets\Scripts\RageLib\Models\IEmbeddedResourceReader.cs" />
     <Compile Include="..\converter\Assets\Scripts\RageLib\Models\Resource\**\*.cs" />
