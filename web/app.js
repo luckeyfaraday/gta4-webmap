@@ -5,12 +5,17 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DDSLoader } from 'three/addons/loaders/DDSLoader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 import { buildSector } from './sector-builder.js';
+import { Timecycle, LightingRig } from './lighting.js';
+import { GradePipeline } from './grade.js';
 
 const ui = {
   loading: document.querySelector('#loading'), status: document.querySelector('#status'), bar: document.querySelector('#bar'),
   mode: document.querySelector('#mode'), sectors: document.querySelector('#sectors'), placements: document.querySelector('#placements'),
   models: document.querySelector('#models'), textures: document.querySelector('#textures'), sectorSelect: document.querySelector('#sector-select'),
   buttons: [...document.querySelectorAll('[data-mode]')], crosshair: document.querySelector('#crosshair'),
+  hour: document.querySelector('#hour'), hourLabel: document.querySelector('#hour-label'),
+  weather: document.querySelector('#weather'), baked: document.querySelector('#baked'),
+  grade: document.querySelector('#grade'),
 };
 
 // Draw calls now scale with texture-array buckets per sector (~23) instead of
@@ -26,17 +31,13 @@ const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
 renderer.setSize(innerWidth, innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 0.9;
+// Tone mapping is deliberately left off the renderer: three.js only applies it
+// when a material draws straight to the canvas, and everything here goes
+// through the grade pipeline's render targets instead. web/grade.js does the
+// ACES pass, with the exposure from timecyc.dat's own Exposure column.
 document.body.prepend(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x8497a3);
-scene.fog = new THREE.FogExp2(0x8497a3, 0.00042);
-scene.add(new THREE.HemisphereLight(0xcce1eb, 0x283237, 1.7));
-const sun = new THREE.DirectionalLight(0xffe0bd, 2.2);
-sun.position.set(-450, 700, 260);
-scene.add(sun);
 
 const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.15, 7000);
 const orbit = new OrbitControls(camera, renderer.domElement);
@@ -51,6 +52,32 @@ const world = await fetch('./assets/world.json').then(response => {
   if (!response.ok) throw new Error('Full world data is not built yet. Run npm run extract:world.');
   return response.json();
 });
+
+const timecycle = new Timecycle(await fetch('./data/timecyc.json').then(response => {
+  if (!response.ok) throw new Error('Timecycle data is not built yet. Run npm run extract:timecyc.');
+  return response.json();
+}));
+const lighting = new LightingRig(scene, renderer, camera, timecycle, { weather: 'EXTRASUNNY', hour: 12 });
+const grading = new GradePipeline(renderer, scene, camera);
+
+// renderer.info.render.calls is reset by every renderer.render(), and the
+// composer issues one per pass, so reading it after the frame reports the final
+// full-screen blit rather than the city. Latch it when the scene itself is done.
+let sceneDrawCalls = 0;
+scene.onAfterRender = () => { sceneDrawCalls = renderer.info.render.calls; };
+
+// GTA IV bakes prelighting into COLOR_0 and the extractor writes it into every
+// GLB. GLTFLoader already switches vertexColors on by itself whenever a
+// primitive carries COLOR_0, so this was live before the toggle existed; what
+// the toggle adds is the ability to render without it for comparison, plus the
+// terrain exclusion below.
+//
+// Measured over 520k sampled vertices in the Manhattan sectors, the luminance
+// is spread broadly across 0..1 (mean 0.49) with spikes at both ends rather
+// than sitting near white with darkening only in crevices. That is more than
+// plain ambient occlusion, and how each shader family is meant to scale it is
+// still open - see test/baked-ab.mjs.
+let bakedLighting = true;
 
 const loaded = new Map();
 const loading = new Map();
@@ -116,6 +143,14 @@ function releaseSource(root) {
   });
 }
 
+// Batching moved the baked-lighting decision into sector-builder.js, which
+// sorts geometry into baked and non-baked batches at build time (the
+// gta_terrain_va_* family reuses COLOR_0 as blend weights, so it is kept out).
+// All that is left here is flipping the toggle on the batches that carry it.
+function refreshBakedLighting() {
+  for (const record of loaded.values()) record.built?.setBaked(bakedLighting);
+}
+
 async function loadSector(sector) {
   if (loaded.has(sector.id)) return loaded.get(sector.id);
   if (loading.has(sector.id)) return loading.get(sector.id);
@@ -151,6 +186,9 @@ async function loadSector(sector) {
     if (!loaded.has(sector.id)) { built.dispose(); return record; }
 
     built.container.name = `sector:${sector.id}`;
+    // A sector that streams in after the toggle was flipped would otherwise
+    // arrive baked while the rest of the city is not.
+    built.setBaked(bakedLighting);
     scene.add(built.container);
     record.built = built;
     record.ready = true;
@@ -208,7 +246,7 @@ function updateStats() {
   ui.sectors.textContent = `${loaded.size} / ${world.sectors.length}`;
   ui.placements.textContent = placements.toLocaleString();
   ui.models.textContent = models.toLocaleString();
-  ui.textures.textContent = `${textureLayers.toLocaleString()} arrays · ${renderer.info.render.calls} calls`;
+  ui.textures.textContent = `${textureLayers.toLocaleString()} arrays · ${sceneDrawCalls} calls`;
 }
 
 function setMode(next) {
@@ -296,6 +334,30 @@ function movePlayer(dt) {
   }
 }
 
+for (const name of timecycle.weathers) {
+  const option = document.createElement('option');
+  option.value = option.textContent = name;
+  ui.weather.append(option);
+}
+ui.weather.value = lighting.weather;
+ui.hour.value = lighting.hour;
+
+function formatHour(hour) {
+  const minutes = Math.round(hour * 60) % 1440;
+  return `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`;
+}
+
+function refreshLightingLabel() {
+  const { from, to, blend } = lighting.frame;
+  ui.hourLabel.textContent = `${formatHour(lighting.hour)} · ${blend < 0.5 ? from : to}`;
+}
+
+ui.hour.addEventListener('input', () => { lighting.setHour(Number(ui.hour.value)); refreshLightingLabel(); });
+ui.weather.addEventListener('change', () => { lighting.setWeather(ui.weather.value); refreshLightingLabel(); });
+ui.baked.addEventListener('change', () => { bakedLighting = ui.baked.checked; refreshBakedLighting(); });
+ui.grade.addEventListener('change', () => { grading.enabled = ui.grade.checked; });
+refreshLightingLabel();
+
 ui.buttons.forEach(button => button.addEventListener('click', () => setMode(button.dataset.mode)));
 renderer.domElement.addEventListener('click', () => { if (mode !== 'overview' && !pointer.isLocked) pointer.lock(); });
 ui.sectorSelect.addEventListener('change', () => teleport(world.sectors.find(sector => sector.id === ui.sectorSelect.value)));
@@ -314,16 +376,36 @@ setTimeout(() => { ui.loading.classList.add('done'); setTimeout(() => ui.loading
 streamSectors(true);
 
 globalThis.gta4map = {
-  scene, camera, renderer, world, setMode, tuning,
+  scene, camera, renderer, world, setMode, tuning, lighting, timecycle,
+  setHour: hour => { lighting.setHour(hour); ui.hour.value = hour; refreshLightingLabel(); },
+  setWeather: name => { lighting.setWeather(name); ui.weather.value = name; refreshLightingLabel(); },
+  setBakedLighting: enabled => { bakedLighting = ui.baked.checked = enabled; refreshBakedLighting(); },
+  setGrade: enabled => { grading.enabled = ui.grade.checked = enabled; },
+  grading,
   getState: () => ({
     ready: initialized,
     mode,
+    lighting: {
+      hour: lighting.hour,
+      weather: lighting.weather,
+      baked: bakedLighting,
+      exposure: lighting.exposure,
+      sun: lighting.sunDir.toArray(),
+      sunIntensity: lighting.sun.intensity,
+      ambientIntensity: lighting.ambient.intensity,
+      fogDensity: lighting.scene.fog.density,
+      grade: grading.enabled,
+      bloom: [grading.bloom.threshold, grading.bloom.strength],
+      colourCorrect: lighting.frame.colourCorrect,
+      desaturation: [lighting.frame.desaturation, lighting.frame.desaturationFar],
+      depthFx: [lighting.frame.depthFxNear, lighting.frame.depthFxFar],
+    },
     loadedSectors: [...loaded.keys()],
     // Sectors whose GLB has arrived but whose batches are still being built.
     pendingSectors: [...loaded.values()].filter(record => !record.ready).map(record => record.sector.id),
     sectors: world.sectors.length,
     textures: textureLayers,
-    drawCalls: renderer.info.render.calls,
+    drawCalls: sceneDrawCalls,
     batches: [...loaded.values()].filter(r => r.ready).reduce((a, r) => a + r.built.stats.batches, 0),
     textureBytes: [...loaded.values()].filter(r => r.ready).reduce((a, r) => a + r.built.stats.bytes, 0),
     camera: camera.position.toArray(),
@@ -335,13 +417,18 @@ function frame() {
   timer.update();
   const dt = Math.min(timer.getDelta(), 0.05);
   movePlayer(dt);
+  lighting.follow();
   streamTimer -= dt;
   if (streamTimer <= 0) { streamTimer = 1.2; streamSectors(); }
-  renderer.render(scene, camera);
+  // A handful of uniform writes, so it is cheaper than tracking when the
+  // keyframe or the toggle last changed.
+  grading.update(lighting.frame, lighting.exposure);
+  grading.render();
 }
 frame();
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
+  grading.setSize(innerWidth, innerHeight);
 });

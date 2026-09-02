@@ -7,13 +7,19 @@ import { TextureArraySet, BundledArrays } from './texture-arrays.js';
 
 const CUTOUT = /decal|cutout|trees|fence|grate|railing/i;
 
+// GTA IV bakes prelighting into COLOR_0, but the gta_terrain_va_* family reuses
+// the same channel as per-layer blend weights, so feeding those to the renderer
+// as vertex colour would tint every blended surface. They are batched
+// separately with vertexColors off rather than being tinted or dropped.
+const BLEND_WEIGHT_SHADER = /terrain_va/i;
+
 // Sampling a sampler2DArray needs a per-vertex layer index. Wiring it through
 // three's built-in map slot keeps lighting, fog and tone mapping intact; the
 // 1x1 placeholder in `map` only exists so USE_MAP declares vMapUv for us.
 const PLACEHOLDER = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
 PLACEHOLDER.needsUpdate = true;
 
-function makeMaterial(arrayTexture, cutout) {
+function makeMaterial(arrayTexture, cutout, baked) {
   // Foliage/fences/decals are alpha-*tested*, not alpha-blended: keeping them
   // opaque with depth writes means no per-instance back-to-front sort is needed
   // and they depth-sort correctly against each other.
@@ -21,7 +27,12 @@ function makeMaterial(arrayTexture, cutout) {
     map: PLACEHOLDER, roughness: 0.88, metalness: 0,
     transparent: false, alphaTest: cutout ? 0.5 : 0, depthWrite: true,
     side: cutout ? THREE.DoubleSide : THREE.FrontSide,
+    vertexColors: baked,
   });
+  // Batching erases the per-placement materials the viewer used to introspect,
+  // so record what this batch is: app.js toggles `baked` ones and the tests
+  // count them.
+  material.userData.batch = { cutout, baked, array: arrayTexture };
   material.onBeforeCompile = shader => {
     shader.uniforms.mapArray = { value: arrayTexture };
     shader.vertexShader = `attribute float layer;\nvarying float vLayer;\n${shader.vertexShader}`
@@ -33,21 +44,42 @@ function makeMaterial(arrayTexture, cutout) {
       `);
   };
   // Variants must not collide in the program cache with the stock material.
-  material.customProgramCacheKey = () => `array:${cutout ? 'cutout' : 'opaque'}`;
+  material.customProgramCacheKey = () => `array:${cutout ? 'cutout' : 'opaque'}:${baked ? 'baked' : 'plain'}`;
   material.needsUpdate = true;
   return material;
 }
 
 // BatchedMesh demands one identical attribute layout across a batch.
-function normalize(geometry, layer) {
+function normalize(geometry, layer, baked) {
   const out = new THREE.BufferGeometry();
   out.setAttribute('position', geometry.getAttribute('position'));
   out.setAttribute('normal', geometry.getAttribute('normal') ?? computeNormals(geometry));
   const count = geometry.getAttribute('position').count;
   out.setAttribute('uv', geometry.getAttribute('uv') ?? new THREE.BufferAttribute(new Float32Array(count * 2), 2));
   out.setAttribute('layer', new THREE.BufferAttribute(new Float32Array(count).fill(layer), 1));
+  if (baked) out.setAttribute('color', bakedColour(geometry, count));
   out.setIndex(geometry.getIndex() ?? implicitIndex(count));
   return out;
+}
+
+// COLOR_0 arrives as vec3 or vec4 and as normalized bytes or floats depending on
+// the placement, but one batch needs one layout, so everything is widened to a
+// float vec3. get{X,Y,Z} decodes the normalized case for us. Geometry with no
+// baked data at all sits in the same batches as geometry that has it, so it
+// gets white — no COLOR_0 means nothing to darken by.
+function bakedColour(geometry, count) {
+  const source = geometry.getAttribute('color');
+  const data = new Float32Array(count * 3);
+  if (!source) {
+    data.fill(1);
+  } else {
+    for (let i = 0; i < count; i++) {
+      data[i * 3] = source.getX(i);
+      data[i * 3 + 1] = source.getY(i);
+      data[i * 3 + 2] = source.getZ(i);
+    }
+  }
+  return new THREE.BufferAttribute(data, 3);
 }
 
 function computeNormals(geometry) {
@@ -132,11 +164,13 @@ export async function buildSector({ root, sectorUrl, loadDDS, bundle, maxEdge = 
   for (const draw of draws) {
     const spot = draw.url ? placement.get(draw.url) : null;
     if (!spot) continue; // untextured or failed; nothing sensible to batch it with
-    const cutout = CUTOUT.test(draw.material.userData?.shader ?? '');
-    const key = `${spot.key}|${cutout ? 'cutout' : 'opaque'}`;
+    const shader = draw.material.userData?.shader ?? '';
+    const cutout = CUTOUT.test(shader);
+    const baked = !BLEND_WEIGHT_SHADER.test(shader);
+    const key = `${spot.key}|${cutout ? 'cutout' : 'opaque'}|${baked ? 'baked' : 'plain'}`;
     let group = groups.get(key);
     if (!group) {
-      group = { arrayKey: spot.key, cutout, entries: new Map(), instances: 0, vertices: 0, indices: 0 };
+      group = { arrayKey: spot.key, cutout, baked, entries: new Map(), instances: 0, vertices: 0, indices: 0 };
       groups.set(key, group);
     }
     // Same geometry + same layer can share one batch geometry and differ only
@@ -159,7 +193,7 @@ export async function buildSector({ root, sectorUrl, loadDDS, bundle, maxEdge = 
   container.name = 'batched';
   const materials = [];
   for (const group of groups.values()) {
-    const material = makeMaterial(arrays.get(group.arrayKey), group.cutout);
+    const material = makeMaterial(arrays.get(group.arrayKey), group.cutout, group.baked);
     materials.push(material);
     const batch = new THREE.BatchedMesh(group.instances, group.vertices, group.indices, material);
     // Each batch already covers a single sector, so the Object3D-level frustum
@@ -169,7 +203,7 @@ export async function buildSector({ root, sectorUrl, loadDDS, bundle, maxEdge = 
     batch.perObjectFrustumCulled = perObjectCull;
     batch.sortObjects = false;
     for (const entry of group.entries.values()) {
-      const geometry = normalize(entry.geometry, entry.layer);
+      const geometry = normalize(entry.geometry, entry.layer, group.baked);
       const geometryId = batch.addGeometry(geometry);
       for (const matrix of entry.matrices) batch.setMatrixAt(batch.addInstance(geometryId), matrix);
       geometry.dispose();
@@ -178,10 +212,28 @@ export async function buildSector({ root, sectorUrl, loadDDS, bundle, maxEdge = 
     container.add(batch);
   }
 
+  const bakedMaterials = materials.filter(material => material.userData.batch.baked);
+
   return {
     container,
     arrays,
-    stats: { batches: groups.size, instances: draws.reduce((a, d) => a + d.matrices.length, 0), ...arrays.stats() },
+    materials,
+    stats: {
+      batches: groups.size,
+      bakedBatches: bakedMaterials.length,
+      instances: draws.reduce((a, d) => a + d.matrices.length, 0),
+      ...arrays.stats(),
+    },
+    // Only batches that actually carry a colour attribute can be switched back
+    // on, so the terrain_va ones are left alone rather than asked to read an
+    // attribute their geometry does not have.
+    setBaked(enabled) {
+      for (const material of bakedMaterials) {
+        if (material.vertexColors === enabled) continue;
+        material.vertexColors = enabled;
+        material.needsUpdate = true;
+      }
+    },
     dispose() {
       for (const batch of container.children) batch.dispose();
       for (const material of materials) material.dispose();

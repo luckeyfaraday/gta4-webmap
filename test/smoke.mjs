@@ -75,19 +75,31 @@ try {
   const aboveGround = state.camera[1] > alderney.min[1];
   if (!aboveGround) throw new Error(`Camera fell below Alderney: y=${state.camera[1]} < ${alderney.min[1]}`);
 
+  // Sector geometry is drawn by BatchedMeshes that sample a texture array, so
+  // the old per-material `.map` check no longer sees the city at all - it has to
+  // ask whether each batch got a built array. Anything still carrying a plain
+  // `userData.texture` (the player model) is checked the original way.
   const untextured = await page.evaluate(() => {
-    let total = 0, missing = 0;
+    let total = 0, missing = 0, batches = 0, emptyBatches = 0;
     globalThis.gta4map.scene.traverse(object => {
       if (!object.isMesh) return;
       for (const material of [object.material].flat()) {
+        if (material?.userData?.batch) {
+          batches++;
+          const array = material.userData.batch.array;
+          if (!array?.image?.depth) emptyBatches++;
+          continue;
+        }
         if (!material?.userData?.texture) continue;
         total++;
         if (!material.map) missing++;
       }
     });
-    return { total, missing };
+    return { total, missing, batches, emptyBatches };
   });
   if (untextured.missing > 0) throw new Error(`${untextured.missing}/${untextured.total} materials are still untextured.`);
+  if (untextured.batches === 0) throw new Error('No batched sector geometry is in the scene.');
+  if (untextured.emptyBatches > 0) throw new Error(`${untextured.emptyBatches}/${untextured.batches} batches have no texture array.`);
 
   const result = { state, untextured, interaction: { orbitChangedCamera: true, flyMovedCamera: true, walkModeEntered: true, alderneyLoaded: true, aboveGround: true }, messages };
   await writeFile('artifacts/smoke.json', JSON.stringify(result, null, 2));
