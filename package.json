@@ -6,7 +6,9 @@
     "serve": "npx --yes http-server web -p 4174 -c-1",
     "extract": "powershell -NoProfile -ExecutionPolicy Bypass -File ./extract-map.ps1",
     "extract:world": "powershell -NoProfile -ExecutionPolicy Bypass -File ./extract-world.ps1",
-    "test": "node ./test/smoke.mjs"
+    "extract:player": "powershell -NoProfile -ExecutionPolicy Bypass -File ./extract-player.ps1",
+    "test": "node ./test/smoke.mjs",
+    "test:player": "node ./test/player.mjs"
   },
   "dependencies": {
     "three": "0.185.1"

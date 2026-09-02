@@ -46,3 +46,11 @@ public static class Debug
     public static void Log(object value) => System.Console.WriteLine(value);
     public static void LogWarning(object value) => System.Console.Error.WriteLine(value);
 }
+
+// RPFFileSystem looks for an optional KnownFilenames.txt beside the binary to
+// name entries that are stored as hashes only. playerped.rpf keeps its real
+// names, so an empty lookup table is fine.
+public static class Application
+{
+    public static string streamingAssetsPath => System.IO.Path.Combine(System.AppContext.BaseDirectory, "StreamingAssets");
+}
