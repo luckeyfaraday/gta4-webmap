@@ -1,0 +1,16 @@
+# Extracted Rockstar assets. ~2 GB of geometry and textures rebuilt by
+# `npm run extract:world`; never belongs in the repository.
+web/assets/
+
+# Build and tooling output
+node_modules/
+extractor/bin/
+extractor/obj/
+.dotnet/
+artifacts/
+.claude/worktrees/
+
+# Vendored IV-Unity converter: an upstream checkout with its own git history.
+# RageLib under converter/Assets/Scripts is compiled into the extractor by
+# path, so worktrees junction this directory rather than copying it.
+converter/

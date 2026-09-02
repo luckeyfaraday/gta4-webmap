@@ -1,0 +1,18 @@
+{
+  "name": "gta4-webmap",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "serve": "npx --yes http-server web -p 4174 -c-1",
+    "extract": "powershell -NoProfile -ExecutionPolicy Bypass -File ./extract-map.ps1",
+    "extract:world": "powershell -NoProfile -ExecutionPolicy Bypass -File ./extract-world.ps1",
+    "test": "node ./test/smoke.mjs"
+  },
+  "dependencies": {
+    "three": "0.185.1"
+  },
+  "devDependencies": {
+    "http-server": "14.1.1",
+    "playwright-core": "1.62.1"
+  }
+}

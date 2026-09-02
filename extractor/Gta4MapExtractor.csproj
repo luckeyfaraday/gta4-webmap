@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="HeadlessTextures.cs" />
+    <Compile Include="UnityStubs.cs" />
+    <Compile Include="..\converter\Assets\Scripts\RageLib\Common\**\*.cs" />
+    <Compile Include="..\converter\Assets\Scripts\RageLib\FileSystem\Common\**\*.cs" />
+    <Compile Include="..\converter\Assets\Scripts\RageLib\FileSystem\IMG\**\*.cs" />
+    <Compile Include="..\converter\Assets\Scripts\RageLib\FileSystem\IMGFileSystem.cs" />
+    <Compile Include="..\converter\Assets\Scripts\RageLib\Models\IDataReader.cs" />
+    <Compile Include="..\converter\Assets\Scripts\RageLib\Models\IEmbeddedResourceReader.cs" />
+    <Compile Include="..\converter\Assets\Scripts\RageLib\Models\Resource\**\*.cs" />
+    <Compile Include="..\converter\Assets\Scripts\RageLib\Textures\Resource\**\*.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="ICSharpCode.SharpZipLib">
+      <HintPath>..\converter\Assets\Plugins\Managed\ICSharpCode.SharpZipLib.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>
