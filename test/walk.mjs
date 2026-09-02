@@ -111,6 +111,63 @@ try {
   check(landed.player.grounded, 'the character never landed');
   check(Math.abs(landed.player.position[1] - groundY) < 1.5, 'the character did not land back near the ground');
 
+  // Walls have to stop him. Rather than assume where the geometry is, try every
+  // compass direction and require that at least one of them blocks him, and
+  // that being blocked leaves him standing on the ground rather than inside a
+  // building or falling through one.
+  // Find the nearest wall rather than assuming where the city put one.
+  const scan = () => page.evaluate(() => {
+    const { THREE, collisionMeshes, getState } = globalThis.gta4map;
+    const meshes = collisionMeshes();
+    const position = getState().player.position;
+    const origin = new THREE.Vector3(position[0], position[1] + 1.15, position[2]);
+    const ray = new THREE.Raycaster();
+    ray.near = 0;
+    ray.far = 40;
+    const rows = [];
+    for (let step = 0; step < 16; step++) {
+      const yaw = step * Math.PI / 8;
+      ray.set(origin, new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw)));
+      const hit = ray.intersectObjects(meshes, false)[0];
+      rows.push({ yaw, distance: hit ? hit.distance : Infinity });
+    }
+    return rows;
+  });
+
+  const wall = (await scan()).reduce((a, b) => (b.distance < a.distance ? b : a));
+  check(wall.distance < 25, `no wall within reach to test collision against (nearest ${wall.distance.toFixed(1)}m)`);
+
+  // Walk at it until the controller has asked for well past its distance, then
+  // measure. `efficiency` is distance covered over distance asked for, so it
+  // does not care how many frames the headless browser managed: near 1 is a
+  // clear run, near 0 is being held by a wall.
+  // `look` aims the camera, which sits opposite the way he walks, so face him
+  // at the wall by pointing the camera the other way.
+  await page.evaluate(angle => globalThis.gta4map.look(angle + Math.PI, -0.1), wall.yaw);
+  const approachFrom = (await state()).player.commanded;
+  await page.keyboard.down('w');
+  await page.waitForFunction(
+    ([start, needed]) => globalThis.gta4map.getState().player.commanded - start > needed,
+    [approachFrom, wall.distance + 4], { timeout: 120_000 });
+
+  const pressBefore = await state();
+  await page.waitForTimeout(1500);
+  const pressAfter = await state();
+  await page.keyboard.up('w');
+  await page.waitForTimeout(150);
+
+  const commanded = pressAfter.player.commanded - pressBefore.player.commanded;
+  const travelled = pressAfter.player.travelled - pressBefore.player.travelled;
+  const efficiency = commanded > 0 ? travelled / commanded : 1;
+  check(commanded > 1, `the character stopped being driven into the wall (commanded ${commanded.toFixed(2)}m)`);
+  check(efficiency < 0.35, `the character walked through the wall (covered ${(efficiency * 100).toFixed(0)}% of the commanded distance while pressed against it)`);
+  check(pressAfter.player.grounded, 'the character ended up off the ground at the wall');
+
+  // And he should have come to rest just short of the surface, not inside it.
+  const gap = (await scan()).reduce((a, b) => (b.distance < a.distance ? b : a)).distance;
+  check(gap > 0.15 && gap < 1.5, `the character came to rest ${gap.toFixed(2)}m from the nearest surface`);
+  await page.screenshot({ path: 'artifacts/player-collision.png' });
+
   // First person hides him and keeps the camera at eye level.
   await page.keyboard.press('v');
   await page.waitForTimeout(300);
@@ -128,6 +185,10 @@ try {
     cameraDistance: Number(eye.toFixed(2)),
     facingAlignment: Number(alignment.toFixed(3)),
     jumpHeight: Number((airborne.player.position[1] - groundY).toFixed(2)),
+    wallDistance: Number(wall.distance.toFixed(2)),
+    wallEfficiency: Number(efficiency.toFixed(3)),
+    restingGap: Number(gap.toFixed(2)),
+    nearMeshes: pressAfter.player.nearMeshes,
     failures,
     messages: messages.filter(message => message.startsWith('[pageerror]')),
   };

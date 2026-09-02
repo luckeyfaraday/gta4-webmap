@@ -54,7 +54,6 @@ const down = new THREE.Vector3(0, -1, 0);
 const raycaster = new THREE.Raycaster();
 let mode = 'overview';
 let verticalVelocity = 0;
-let groundTimer = 0;
 let fallTimer = 0;
 let streamTimer = 0;
 let initialized = false;
@@ -71,6 +70,15 @@ const GAITS = [
 ];
 const EYE_HEIGHT = 1.62;
 const CAMERA_DISTANCE = 3.9;
+// Roughly shoulder width. Collision probes sit above STEP_HEIGHT so kerbs and
+// steps are walked up rather than bumped into.
+const PLAYER_RADIUS = 0.34;
+const STEP_HEIGHT = 0.45;
+const COLLIDE_HEIGHTS = [0.6, 1.15, 1.55];
+const COLLIDE_DIRECTIONS = Array.from({ length: 8 }, (_, index) => {
+  const angle = index * Math.PI / 4;
+  return new THREE.Vector3(Math.sin(angle), 0, Math.cos(angle));
+});
 // Which way the bind pose faces. The export cancels each clip's own opening
 // yaw, so this single constant aligns the model with the direction the
 // controller thinks it is walking. Calibrated against the eye joints, which
@@ -84,13 +92,58 @@ const player = {
   speed: 0,
   grounded: false,
   thirdPerson: true,
+  // Distance the controller asked for versus distance actually covered. They
+  // part company exactly when something is in the way, which makes "is he
+  // blocked?" answerable without reference to frame rate or wall-clock time.
+  commanded: 0,
+  travelled: 0,
+  pushes: 0,
 };
 // Camera orbit around the player, driven by the mouse while pointer-locked.
 const view = { yaw: 0, pitch: -0.12 };
 const focus = new THREE.Vector3();
 const cameraOffset = new THREE.Vector3();
+const probeOrigin = new THREE.Vector3();
+const pushNormal = new THREE.Vector3();
 let landTimer = 0;
+let unstickTimer = 0;
 let animState = 'idle';
+
+// Colliding against every mesh in five loaded sectors, several times a frame,
+// is far more than the character needs. Keep a short list of what is actually
+// within reach and rebuild it only when he leaves the area it was built for or
+// the streamed sectors change.
+const NEAR_RADIUS = 14;
+let nearMeshes = [];
+let sectorEpoch = 0;
+let nearEpoch = -1;
+const nearOrigin = new THREE.Vector3(Infinity, Infinity, Infinity);
+
+// Sector geometry never moves, so each mesh's world bounding sphere is worth
+// computing once and keeping.
+function worldSphere(mesh) {
+  if (!mesh.userData.worldSphere) {
+    if (!mesh.geometry.boundingSphere) mesh.geometry.computeBoundingSphere();
+    mesh.updateWorldMatrix(true, false);
+    mesh.userData.worldSphere = mesh.geometry.boundingSphere.clone().applyMatrix4(mesh.matrixWorld);
+  }
+  return mesh.userData.worldSphere;
+}
+
+function refreshNearMeshes() {
+  if (nearEpoch === sectorEpoch && nearOrigin.distanceToSquared(player.position) < 16) return;
+  nearEpoch = sectorEpoch;
+  nearOrigin.copy(player.position);
+  nearMeshes = [];
+  for (const record of loaded.values()) {
+    if (!record.ready) continue;
+    for (const mesh of record.meshes) {
+      const sphere = worldSphere(mesh);
+      const reach = sphere.radius + NEAR_RADIUS;
+      if (sphere.center.distanceToSquared(player.position) < reach * reach) nearMeshes.push(mesh);
+    }
+  }
+}
 
 for (const sector of world.sectors) {
   const option = document.createElement('option');
@@ -239,6 +292,7 @@ async function loadSector(sector) {
     updateStats();
     await applyTextures(gltf.scene, sector.url, sector.id);
     record.ready = true;
+    sectorEpoch++;
     gltf.scene.visible = true;
     updateStats();
     return record;
@@ -259,6 +313,8 @@ function unloadSector(id) {
     }
   });
   loaded.delete(id);
+  // The near list may hold meshes that were just disposed.
+  sectorEpoch++;
   updateStats();
 }
 
@@ -354,13 +410,12 @@ function updateFollowCamera() {
     Math.sin(view.pitch),
     Math.cos(view.yaw) * Math.cos(view.pitch));
   let distance = CAMERA_DISTANCE;
-  const meshes = [...loaded.values()].flatMap(record => record.meshes);
-  if (meshes.length) {
+  if (nearMeshes.length) {
     // Pull in rather than let the camera sink through whatever is behind him.
     raycaster.set(focus, cameraOffset);
     raycaster.near = 0;
     raycaster.far = CAMERA_DISTANCE + 0.4;
-    const hit = raycaster.intersectObjects(meshes, false)[0];
+    const hit = raycaster.intersectObjects(nearMeshes, false)[0];
     if (hit) distance = Math.max(0.65, hit.distance - 0.35);
   }
   camera.position.copy(focus).addScaledVector(cameraOffset, distance);
@@ -414,9 +469,12 @@ function moveWalk(dt) {
   if (keys.has('KeyD')) movement.add(right);
   if (keys.has('KeyA')) movement.sub(right);
 
+  refreshNearMeshes();
+
   const gait = keys.has('ShiftLeft') ? 3 : keys.has('AltLeft') ? 1 : 2;
   const wanted = movement.lengthSq() ? GAITS[gait].speed : 0;
   player.speed = wanted;
+  const wasAt = { x: player.position.x, z: player.position.z };
   if (wanted > 0) {
     movement.normalize();
     player.position.addScaledVector(movement, wanted * dt);
@@ -428,35 +486,95 @@ function moveWalk(dt) {
     player.yaw += Math.max(-9 * dt, Math.min(9 * dt, delta));
   }
 
+  resolveWalls(movement, wanted > 0, dt);
+
+  player.commanded += wanted * dt;
+  player.travelled += Math.hypot(player.position.x - wasAt.x, player.position.z - wasAt.z);
+
   verticalVelocity -= 22 * dt;
   player.position.y += verticalVelocity * dt;
-  groundTimer -= dt;
-  if (groundTimer <= 0) {
-    groundTimer = 0.08;
-    raycaster.set(new THREE.Vector3(player.position.x, player.position.y + 3, player.position.z), down);
-    raycaster.near = 0;
-    raycaster.far = Math.max(12, Math.abs(verticalVelocity) * 0.25 + 8);
-    const meshes = [...loaded.values()].flatMap(record => record.meshes);
-    const hit = raycaster.intersectObjects(meshes, false)[0];
-    if (hit && player.position.y <= hit.point.y && verticalVelocity <= 0) {
-      if (!player.grounded) landTimer = 0.32;
-      player.position.y = hit.point.y;
-      verticalVelocity = keys.has('Space') ? 6.4 : 0;
-      player.grounded = verticalVelocity === 0;
-      fallTimer = 0;
-    } else if (verticalVelocity < 0) {
-      // No ground within the short probe. Streaming gaps and teleports can drop
-      // the player out of the world entirely, so recover after a brief fall.
-      player.grounded = false;
-      fallTimer += 0.08;
-      if (fallTimer > 1.2) snapToGround();
-    }
+
+  // Ground contact is resolved every frame. Probing on a timer instead let a
+  // frame's worth of gravity accumulate between corrections, which showed up as
+  // the character (and the camera following him) vibrating on flat ground.
+  const hit = groundProbe(dt);
+  if (hit && verticalVelocity <= 0 && player.position.y <= hit.point.y) {
+    if (!player.grounded) landTimer = 0.32;
+    player.position.y = hit.point.y;
+    verticalVelocity = keys.has('Space') ? 6.4 : 0;
+    player.grounded = verticalVelocity === 0;
+    fallTimer = 0;
+  } else if (verticalVelocity < 0) {
+    // Streaming gaps and teleports can drop the player out of the world
+    // entirely, so recover after a brief fall.
+    player.grounded = false;
+    fallTimer += dt;
+    if (fallTimer > 1.2) snapToGround();
   }
 
   carrier.position.copy(player.position);
   carrier.rotation.y = player.yaw + MODEL_YAW_OFFSET;
   updateFollowCamera();
   updateAnimation(dt);
+}
+
+// Looks for ground from STEP_HEIGHT above his feet, so a kerb or a step within
+// that height reads as ground to walk up onto rather than a wall to stop at.
+function groundProbe(dt) {
+  if (!nearMeshes.length) return null;
+  probeOrigin.set(player.position.x, player.position.y + STEP_HEIGHT, player.position.z);
+  raycaster.set(probeOrigin, down);
+  raycaster.near = 0;
+  raycaster.far = STEP_HEIGHT + Math.max(1, Math.abs(verticalVelocity) * dt * 2 + 0.5);
+  return raycaster.intersectObjects(nearMeshes, false)[0] ?? null;
+}
+
+// Pushes him back out of whatever he has walked into. Sector meshes carry no
+// acceleration structure, so a ray that clips a building's bounding sphere
+// scans its whole triangle list: probes are the expensive part of the frame and
+// are spent only where he is actually heading. Pushing along the surface normal
+// rather than back down the probe leaves the movement parallel to the wall
+// intact, which is what makes him slide along it instead of sticking.
+function pushOutOf(direction) {
+  let pushed = false;
+  for (const height of COLLIDE_HEIGHTS) {
+    probeOrigin.set(player.position.x, player.position.y + height, player.position.z);
+    raycaster.set(probeOrigin, direction);
+    raycaster.near = 0;
+    raycaster.far = PLAYER_RADIUS;
+    const hit = raycaster.intersectObjects(nearMeshes, false)[0];
+    if (!hit) continue;
+    player.pushes++;
+    if (hit.face) {
+      pushNormal.copy(hit.face.normal).transformDirection(hit.object.matrixWorld);
+      pushNormal.y = 0;
+      // Map materials are double-sided, so a face can come back pointing away
+      // from us. Keep the side that pushes him out.
+      if (pushNormal.lengthSq() < 1e-6 || pushNormal.dot(direction) > 0) pushNormal.copy(direction).negate();
+      else pushNormal.normalize();
+    } else {
+      pushNormal.copy(direction).negate();
+    }
+    player.position.addScaledVector(pushNormal, PLAYER_RADIUS - hit.distance);
+    pushed = true;
+  }
+  return pushed;
+}
+
+function resolveWalls(movement, moving, dt) {
+  if (!nearMeshes.length) return;
+  if (moving) {
+    // Two passes so that sliding into a corner resolves against both faces.
+    if (pushOutOf(movement)) pushOutOf(movement);
+  }
+  // Standing still he cannot walk into anything, but a teleport or a sector
+  // streaming in around him can leave him embedded. Sweep every direction
+  // occasionally to work back out of that.
+  unstickTimer -= dt;
+  if (unstickTimer <= 0) {
+    unstickTimer = 0.5;
+    for (const direction of COLLIDE_DIRECTIONS) pushOutOf(direction);
+  }
 }
 
 // Picks a clip from what the character is actually doing. Playback rate is
@@ -513,7 +631,12 @@ setTimeout(() => { ui.loading.classList.add('done'); setTimeout(() => ui.loading
 streamSectors(true);
 
 globalThis.gta4map = {
-  scene, camera, renderer, world, setMode, character,
+  THREE, scene, camera, renderer, world, setMode, character,
+  // What the character is currently colliding against, for debugging from the
+  // console or a test.
+  collisionMeshes: () => nearMeshes,
+  // Aims the walk-mode camera without a mouse, for scripted playback and tests.
+  look: (yaw, pitch = view.pitch) => { view.yaw = yaw; view.pitch = pitch; },
   getState: () => ({
     ready: initialized,
     mode,
@@ -535,6 +658,10 @@ globalThis.gta4map = {
       clips: character.clips.length,
       bones: character.bones,
       facing: facingVector()?.toArray() ?? null,
+      nearMeshes: nearMeshes.length,
+      commanded: player.commanded,
+      travelled: player.travelled,
+      pushes: player.pushes,
     } : null,
   }),
 };
