@@ -6,6 +6,7 @@
     "serve": "npx --yes http-server web -p 4174 -c-1",
     "extract": "powershell -NoProfile -ExecutionPolicy Bypass -File ./extract-map.ps1",
     "extract:world": "powershell -NoProfile -ExecutionPolicy Bypass -File ./extract-world.ps1",
+    "pack": "node ./tools/pack-textures.mjs",
     "test": "node ./test/smoke.mjs"
   },
   "dependencies": {

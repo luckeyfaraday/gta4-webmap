@@ -69,4 +69,15 @@ $world = [ordered]@{
     sectors = @($worldSectors)
 }
 $world | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 (Join-Path $root 'web\assets\world.json')
+
+# Pack each sector's textures into GPU texture arrays. Without this the viewer
+# still runs, but it falls back to fetching every DDS individually (~800
+# requests and ~4x the bytes per sector).
+Push-Location $root
+try {
+    node ./tools/pack-textures.mjs
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+finally { Pop-Location }
+
 Write-Host "World ready: $($worldSectors.Count) sectors, $((Get-ChildItem $textureRoot -Filter '*.dds').Count) shared textures"

@@ -4,6 +4,7 @@ import { PointerLockControls } from 'three/addons/controls/PointerLockControls.j
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DDSLoader } from 'three/addons/loaders/DDSLoader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+import { buildSector } from './sector-builder.js';
 
 const ui = {
   loading: document.querySelector('#loading'), status: document.querySelector('#status'), bar: document.querySelector('#bar'),
@@ -11,6 +12,15 @@ const ui = {
   models: document.querySelector('#models'), textures: document.querySelector('#textures'), sectorSelect: document.querySelector('#sector-select'),
   buttons: [...document.querySelectorAll('[data-mode]')], crosshair: document.querySelector('#crosshair'),
 };
+
+// Draw calls now scale with texture-array buckets per sector (~23) instead of
+// with material count (~800), so more of the city can stay resident. The limit
+// is texture memory, not draw calls: measured on an AMD iGPU, 6 sectors renders
+// in 5.7ms at 153MB but 8 sectors falls off a cliff to 20.4ms at 215MB once the
+// arrays no longer fit in dedicated VRAM. Raise these on a discrete GPU.
+// Note maxTextureEdge only applies to the per-file fallback path; bundles are
+// trimmed at pack time (tools/pack-textures.mjs --max-edge).
+const tuning = { residentSectors: 6, maxResidentSectors: 7, unloadDistance: 2200, maxTextureEdge: 256, anisotropy: 8, perObjectCull: false };
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
@@ -37,7 +47,6 @@ const pointer = new PointerLockControls(camera, renderer.domElement);
 
 const gltfLoader = new GLTFLoader().setMeshoptDecoder(MeshoptDecoder);
 const ddsLoader = new DDSLoader();
-const textureLoader = new THREE.TextureLoader();
 const world = await fetch('./assets/world.json').then(response => {
   if (!response.ok) throw new Error('Full world data is not built yet. Run npm run extract:world.');
   return response.json();
@@ -45,7 +54,6 @@ const world = await fetch('./assets/world.json').then(response => {
 
 const loaded = new Map();
 const loading = new Map();
-const textureCache = new Map();
 const keys = new Set();
 const timer = new THREE.Timer();
 const down = new THREE.Vector3(0, -1, 0);
@@ -56,6 +64,9 @@ let groundTimer = 0;
 let fallTimer = 0;
 let streamTimer = 0;
 let initialized = false;
+let textureLayers = 0;
+// Rebuilt only when sectors come and go, instead of on every raycast tick.
+let colliders = [];
 
 for (const sector of world.sectors) {
   const option = document.createElement('option');
@@ -76,56 +87,33 @@ function distanceToSector(position, sector) {
   return Math.hypot(dx, dz);
 }
 
-async function loadTexture(url) {
-  if (!textureCache.has(url)) {
-    const sourceLoader = url.toLowerCase().endsWith('.dds') ? ddsLoader : textureLoader;
-    textureCache.set(url, sourceLoader.loadAsync(url).then(texture => {
-      texture.flipY = false;
-      texture.colorSpace = THREE.SRGBColorSpace;
-      texture.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
-      texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
-      return texture;
-    }));
-  }
-  return textureCache.get(url);
+function refreshColliders() {
+  colliders = [...loaded.values()].filter(record => record.ready).flatMap(record => record.built.container.children);
 }
 
-async function applyTextures(root, sectorUrl, sectorId) {
-  const materials = new Map();
+// Prebuilt texture arrays from tools/pack-textures.mjs. Two requests instead of
+// ~800 per sector, carrying only the mip levels the GPU actually receives.
+// Missing bundles are not an error: the viewer falls back to per-file DDS.
+async function loadBundle(sectorUrl) {
+  const base = new URL(sectorUrl, location.href);
+  try {
+    const manifestResponse = await fetch(new URL('textures.json', base));
+    if (!manifestResponse.ok) return null;
+    const manifest = await manifestResponse.json();
+    const binaryResponse = await fetch(new URL('textures.bin', base));
+    if (!binaryResponse.ok) return null;
+    return { manifest, binary: await binaryResponse.arrayBuffer() };
+  } catch { return null; }
+}
+
+// The GLB scene is only staging: once its geometry has been copied into
+// BatchedMeshes nothing references it, so release it rather than leaving a
+// second copy of every buffer alive.
+function releaseSource(root) {
   root.traverse(object => {
-    if (!object.isMesh) return;
-    const list = Array.isArray(object.material) ? object.material : [object.material];
-    for (const material of list) materials.set(material.uuid, material);
+    if (object.geometry) object.geometry.dispose();
+    for (const material of [object.material].flat()) material?.dispose();
   });
-  const queue = [...materials.values()].filter(material => material.userData?.texture);
-  let complete = 0;
-  async function worker() {
-    while (queue.length) {
-      // Streaming can unload this sector while its textures are still being
-      // fetched. Stop rather than downloading into disposed materials.
-      if (sectorId !== undefined && !loaded.has(sectorId)) return;
-      const material = queue.shift();
-      const url = new URL(material.userData.texture, new URL(sectorUrl, location.href)).href;
-      try {
-        material.map = await loadTexture(url);
-        material.color.set(0xffffff);
-        material.roughness = 0.88;
-        material.metalness = 0;
-        if (/decal|cutout|trees/i.test(material.userData.shader ?? '')) {
-          material.transparent = true;
-          material.alphaTest = 0.08;
-          material.depthWrite = false;
-        }
-        material.needsUpdate = true;
-      } catch (error) { console.warn('Texture failed', url, error); }
-      complete++;
-      if (!initialized) {
-        ui.bar.style.width = `${55 + Math.round(complete / Math.max(1, materials.size) * 45)}%`;
-        ui.status.textContent = `Applying GTA textures · ${complete.toLocaleString()} / ${materials.size.toLocaleString()}`;
-      }
-    }
-  }
-  await Promise.all(Array.from({ length: 20 }, worker));
 }
 
 async function loadSector(sector) {
@@ -133,22 +121,41 @@ async function loadSector(sector) {
   if (loading.has(sector.id)) return loading.get(sector.id);
   const task = (async () => {
     if (!initialized) ui.status.textContent = `Loading ${sector.id} geometry…`;
-    const gltf = await gltfLoader.loadAsync(sector.url, event => {
-      if (!initialized && event.total) ui.bar.style.width = `${Math.round(event.loaded / event.total * 55)}%`;
-    });
-    gltf.scene.name = `sector:${sector.id}`;
-    // Textures are applied asynchronously after the GLB arrives. Until that
-    // finishes every material is still its untextured white base colour, so
-    // keep the sector hidden rather than flashing white geometry over the map.
-    gltf.scene.visible = false;
-    scene.add(gltf.scene);
-    const record = { sector, root: gltf.scene, meshes: [], ready: false };
-    gltf.scene.traverse(object => { if (object.isMesh) record.meshes.push(object); });
+    const [gltf, bundle] = await Promise.all([
+      gltfLoader.loadAsync(sector.url, event => {
+        if (!initialized && event.total) ui.bar.style.width = `${Math.round(event.loaded / event.total * 45)}%`;
+      }),
+      loadBundle(sector.url),
+    ]);
+    const record = { sector, built: null, ready: false };
     loaded.set(sector.id, record);
     updateStats();
-    await applyTextures(gltf.scene, sector.url, sector.id);
+
+    const built = await buildSector({
+      root: gltf.scene,
+      sectorUrl: sector.url,
+      loadDDS: url => ddsLoader.loadAsync(url),
+      bundle,
+      maxEdge: tuning.maxTextureEdge,
+      anisotropy: Math.min(tuning.anisotropy, renderer.capabilities.getMaxAnisotropy()),
+      perObjectCull: tuning.perObjectCull,
+      onProgress: (done, total) => {
+        if (initialized) return;
+        ui.bar.style.width = `${45 + Math.round(done / Math.max(1, total) * 55)}%`;
+        ui.status.textContent = `Packing GTA textures · ${done.toLocaleString()} / ${total.toLocaleString()}`;
+      },
+    });
+    releaseSource(gltf.scene);
+
+    // Streaming can drop this sector while its textures were still downloading.
+    if (!loaded.has(sector.id)) { built.dispose(); return record; }
+
+    built.container.name = `sector:${sector.id}`;
+    scene.add(built.container);
+    record.built = built;
     record.ready = true;
-    gltf.scene.visible = true;
+    textureLayers += built.stats.arrays;
+    refreshColliders();
     updateStats();
     return record;
   })().finally(() => loading.delete(sector.id));
@@ -159,27 +166,35 @@ async function loadSector(sector) {
 function unloadSector(id) {
   const record = loaded.get(id);
   if (!record) return;
-  scene.remove(record.root);
-  record.root.traverse(object => {
-    if (object.geometry) object.geometry.dispose();
-    if (object.material) {
-      const list = Array.isArray(object.material) ? object.material : [object.material];
-      for (const material of list) material.dispose();
-    }
-  });
   loaded.delete(id);
+  if (record.built) {
+    scene.remove(record.built.container);
+    textureLayers -= record.built.stats.arrays;
+    // Frees the batch buffers *and* this sector's texture arrays. The old
+    // per-URL cache never released textures, so touring the map leaked all
+    // 16k of them into VRAM.
+    record.built.dispose();
+  }
+  refreshColliders();
   updateStats();
 }
 
 async function streamSectors(force = false) {
   const reference = mode === 'overview' ? orbit.target : camera.position;
   const ranked = [...world.sectors].sort((a, b) => distanceToSector(reference, a) - distanceToSector(reference, b));
-  const wanted = new Set(ranked.slice(0, 4).map(sector => sector.id));
+  const wanted = new Set(ranked.slice(0, tuning.residentSectors).map(sector => sector.id));
   if (force && ui.sectorSelect.value) wanted.add(ui.sectorSelect.value);
   await Promise.all(ranked.filter(sector => wanted.has(sector.id)).map(loadSector));
-  for (const [id, record] of loaded) {
-    if (!record.ready) continue;
-    if (!wanted.has(id) && distanceToSector(reference, record.sector) > 1400) unloadSector(id);
+
+  // Distance alone let sectors pile up while driving across the map — each one
+  // holds its own texture arrays, so cap the resident set and evict furthest
+  // first to keep VRAM bounded.
+  const evictable = [...loaded.entries()]
+    .filter(([id, record]) => record.ready && !wanted.has(id))
+    .map(([id, record]) => ({ id, distance: distanceToSector(reference, record.sector) }))
+    .sort((a, b) => b.distance - a.distance);
+  for (const { id, distance } of evictable) {
+    if (distance > tuning.unloadDistance || loaded.size > tuning.maxResidentSectors) unloadSector(id);
   }
 }
 
@@ -193,7 +208,7 @@ function updateStats() {
   ui.sectors.textContent = `${loaded.size} / ${world.sectors.length}`;
   ui.placements.textContent = placements.toLocaleString();
   ui.models.textContent = models.toLocaleString();
-  ui.textures.textContent = textureCache.size.toLocaleString();
+  ui.textures.textContent = `${textureLayers.toLocaleString()} arrays · ${renderer.info.render.calls} calls`;
 }
 
 function setMode(next) {
@@ -210,14 +225,13 @@ function setMode(next) {
 // Casts from above the tallest loaded sector rather than from the camera, so it
 // still recovers when the player has already fallen below the map.
 function snapToGround() {
-  const meshes = [...loaded.values()].flatMap(record => record.meshes);
-  if (!meshes.length) return false;
+  if (!colliders.length) return false;
   let top = camera.position.y;
   for (const { sector } of loaded.values()) top = Math.max(top, sector.bounds.max[1]);
   raycaster.set(new THREE.Vector3(camera.position.x, top + 100, camera.position.z), down);
   raycaster.near = 0;
   raycaster.far = (top + 100) - camera.position.y + 2500;
-  const hit = raycaster.intersectObjects(meshes, false)[0];
+  const hit = raycaster.intersectObjects(colliders, false)[0];
   if (!hit) return false;
   camera.position.y = hit.point.y + 1.75;
   verticalVelocity = 0;
@@ -268,8 +282,7 @@ function movePlayer(dt) {
     raycaster.set(new THREE.Vector3(camera.position.x, camera.position.y + 3, camera.position.z), down);
     raycaster.near = 0;
     raycaster.far = Math.max(12, Math.abs(verticalVelocity) * 0.25 + 8);
-    const meshes = [...loaded.values()].flatMap(record => record.meshes);
-    const hit = raycaster.intersectObjects(meshes, false)[0];
+    const hit = raycaster.intersectObjects(colliders, false)[0];
     if (hit && camera.position.y <= hit.point.y + 1.75 && verticalVelocity <= 0) {
       camera.position.y = hit.point.y + 1.75;
       verticalVelocity = keys.has('Space') ? 8 : 0;
@@ -301,16 +314,18 @@ setTimeout(() => { ui.loading.classList.add('done'); setTimeout(() => ui.loading
 streamSectors(true);
 
 globalThis.gta4map = {
-  scene, camera, renderer, world, setMode,
+  scene, camera, renderer, world, setMode, tuning,
   getState: () => ({
     ready: initialized,
     mode,
     loadedSectors: [...loaded.keys()],
-    // Sectors whose geometry is in the scene but whose textures are still being
-    // applied; they are hidden until this drains.
+    // Sectors whose GLB has arrived but whose batches are still being built.
     pendingSectors: [...loaded.values()].filter(record => !record.ready).map(record => record.sector.id),
     sectors: world.sectors.length,
-    textures: textureCache.size,
+    textures: textureLayers,
+    drawCalls: renderer.info.render.calls,
+    batches: [...loaded.values()].filter(r => r.ready).reduce((a, r) => a + r.built.stats.batches, 0),
+    textureBytes: [...loaded.values()].filter(r => r.ready).reduce((a, r) => a + r.built.stats.bytes, 0),
     camera: camera.position.toArray(),
   }),
 };
