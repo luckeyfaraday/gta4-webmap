@@ -7,11 +7,10 @@
 //
 //   * the sun's direction, which the engine spins about the axis in
 //     visualSettings.dat rather than storing per keyframe, and
-//   * the day/night brightness ratio. In timecyc.dat the Exposure column
-//     cancels the light multipliers almost exactly (midday 14.75 x 0.19 = 2.80,
-//     midnight 1.00 x 2.69 = 2.69) because the real engine layers HDR
-//     luminance adaptation, clamped by LumMin/LumMax, on top. We are not
-//     simulating that adaptation, so night is darkened by an explicit factor.
+//   * the day/night brightness ratio, because the Exposure column exists to
+//     cancel the light multipliers and hand the rest to HDR luminance
+//     adaptation that this does not simulate. Exposure is replaced by an
+//     explicit ambient-key curve; see the note in update().
 import * as THREE from 'three';
 
 const NOT_INTERPOLATED = new Set(['label', 'hour', 'extra']);
@@ -77,39 +76,15 @@ export function sunDirection(hour, options = {}, target = new THREE.Vector3()) {
   ).normalize();
 }
 
-// Matches three.js ACESFilmicToneMapping exactly, including its exposure / 0.6
-// scaling, so the sky dome and the tone-mapped scene agree at the horizon
-// instead of showing a seam where fogged geometry meets the sky.
+// The dome emits raw radiance, in the same units as the scene lights, and is
+// tone mapped and encoded by web/grade.js along with everything else. Doing it
+// here instead would put a seam at the horizon where fogged geometry meets the
+// sky, because three.js skips tone mapping entirely when a material renders
+// into a render target.
 const SKY_FRAGMENT = /* glsl */`
 uniform vec3 uHorizon, uZenith, uSunCore, uSunCorona, uSunDir;
-uniform float uSunSize, uSpriteBrightness, uExposure, uHazeAmount;
+uniform float uSunSize, uSpriteBrightness, uHazeAmount;
 varying vec3 vDirection;
-
-vec3 RRTAndODTFit(vec3 v) {
-  vec3 a = v * (v + 0.0245786) - 0.000090537;
-  vec3 b = v * (0.983729 * v + 0.4329510) + 0.238081;
-  return a / b;
-}
-
-vec3 acesFilmic(vec3 color) {
-  const mat3 inputMat = mat3(
-    vec3(0.59719, 0.07600, 0.02840),
-    vec3(0.35458, 0.90834, 0.13383),
-    vec3(0.04823, 0.01566, 0.83777));
-  const mat3 outputMat = mat3(
-    vec3( 1.60475, -0.10208, -0.00327),
-    vec3(-0.53108,  1.10813, -0.07276),
-    vec3(-0.07367, -0.00605,  1.07602));
-  color *= uExposure / 0.6;
-  color = inputMat * color;
-  color = RRTAndODTFit(color);
-  color = outputMat * color;
-  return clamp(color, 0.0, 1.0);
-}
-
-vec3 linearToSRGB(vec3 c) {
-  return mix(pow(c, vec3(0.41666)) * 1.055 - vec3(0.055), c * 12.92, vec3(lessThanEqual(c, vec3(0.0031308))));
-}
 
 void main() {
   vec3 direction = normalize(vDirection);
@@ -128,7 +103,7 @@ void main() {
   // fogged geometry, so fade into the haze colour instead.
   colour = mix(uHorizon * uHazeAmount, colour, smoothstep(-0.10, 0.02, direction.y));
 
-  gl_FragColor = vec4(linearToSRGB(acesFilmic(colour)), 1.0);
+  gl_FragColor = vec4(colour, 1.0);
 }
 `;
 
@@ -150,10 +125,20 @@ export class LightingRig {
     this.weather = options.weather ?? 'EXTRASUNNY';
     this.hour = options.hour ?? 12;
     // All three are viewer-side, not from the game. See the DERIVED note above.
-    this.exposureGain = options.exposureGain ?? 1.4;
-    this.nightGain = options.nightGain ?? 0.3;
+    this.exposureGain = options.exposureGain ?? 1;
+    this.dayKey = options.dayKey ?? 1.7;
+    // Provisional: with no emissive night shaders or street lights yet, the
+    // only thing lighting the city after dark is Amb0, so a truthful night key
+    // renders near-black silhouettes. Lifted until gta_emissivenight* and the
+    // 2dfx coronas exist to light it properly.
+    this.nightKey = options.nightKey ?? 0.55;
     this.skyGain = options.skyGain ?? 0.4;
     this.fogDensity = options.fogDensity ?? 1.5;
+    // The sky is legitimately much brighter than the ground - SkyLightMult is
+    // over 4x AmbLightMult0 at 9AM - but handing the fog that same radiance
+    // makes anything past a few blocks as bright as the sky itself and washes
+    // the city out. The haze is dimmed relative to the dome it is sampled from.
+    this.fogGain = options.fogGain ?? 0.5;
     this.sunPath = { sunrise: SUNRISE, sunset: SUNSET, tilt: 0.42, ...options.sunPath };
 
     this.ambient = new THREE.HemisphereLight(0xffffff, 0xffffff, 1);
@@ -173,7 +158,6 @@ export class LightingRig {
       uSunDir: { value: this.sunDir },
       uSunSize: { value: 1.2 },
       uSpriteBrightness: { value: 1.2 },
-      uExposure: { value: 0.3 },
       uHazeAmount: { value: 0.75 },
     };
 
@@ -213,9 +197,19 @@ export class LightingRig {
     this.sun.position.set(this.sunDir.x, elevation, this.sunDir.z).normalize().multiplyScalar(2000);
 
     const daylight = THREE.MathUtils.smoothstep(this.sunDir.y, -0.15, 0.25);
-    const exposure = frame.exposure * this.exposureGain * THREE.MathUtils.lerp(this.nightGain, 1, daylight);
-    this.renderer.toneMappingExposure = exposure;
-    this.uniforms.uExposure.value = exposure;
+    // DERIVED, and the Exposure column is deliberately not used. In the file
+    // Exposure exists to cancel the light multipliers - EXTRASUNNY midnight is
+    // AmbLightMult0 3.51 at Exposure 2.69, which lands 8x brighter than
+    // midday's 6.25 at 0.19 - because the engine then puts HDR luminance
+    // adaptation, clamped by LumMin/LumMax, on top. Without that adaptation,
+    // honouring Exposure makes midnight as bright as noon.
+    //
+    // So aim the frame's ambient contribution at an explicit target instead,
+    // driven by sun elevation. Exposure cancels out of that arithmetic by
+    // construction, and the result is stable across weathers - RAIN's midnight
+    // Exposure of 0.27 and EXTRASUNNY's 2.69 both land on the same key.
+    const key = THREE.MathUtils.lerp(this.nightKey, this.dayKey, daylight) * this.exposureGain;
+    this.exposure = key / Math.max(frame.ambLightMult0, 1e-3);
 
     srgb(this.ambient.color, frame.amb0);
     srgb(this.ambient.groundColor, frame.amb1);
@@ -248,7 +242,7 @@ export class LightingRig {
     // 9), so it is something closer to a sky-blend or height term. Exponential
     // fog tuned to reach the far plane keeps the near field clear, which is how
     // the game reads, instead of veiling everything a few blocks out.
-    this.scene.fog.color.copy(horizon);
+    this.scene.fog.color.copy(horizon).multiplyScalar(this.fogGain);
     this.scene.fog.density = this.fogDensity / frame.farClip;
     this.scene.background = null;
   }

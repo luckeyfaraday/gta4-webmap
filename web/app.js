@@ -5,6 +5,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DDSLoader } from 'three/addons/loaders/DDSLoader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 import { Timecycle, LightingRig } from './lighting.js';
+import { GradePipeline } from './grade.js';
 
 const ui = {
   loading: document.querySelector('#loading'), status: document.querySelector('#status'), bar: document.querySelector('#bar'),
@@ -13,15 +14,17 @@ const ui = {
   buttons: [...document.querySelectorAll('[data-mode]')], crosshair: document.querySelector('#crosshair'),
   hour: document.querySelector('#hour'), hourLabel: document.querySelector('#hour-label'),
   weather: document.querySelector('#weather'), baked: document.querySelector('#baked'),
+  grade: document.querySelector('#grade'),
 };
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
 renderer.setSize(innerWidth, innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-// Exposure is owned by the lighting rig from here on; timecyc.dat carries an
-// Exposure column per keyframe.
+// Tone mapping is deliberately left off the renderer: three.js only applies it
+// when a material draws straight to the canvas, and everything here goes
+// through the grade pipeline's render targets instead. web/grade.js does the
+// ACES pass, with the exposure from timecyc.dat's own Exposure column.
 document.body.prepend(renderer.domElement);
 
 const scene = new THREE.Scene();
@@ -46,6 +49,7 @@ const timecycle = new Timecycle(await fetch('./data/timecyc.json').then(response
   return response.json();
 }));
 const lighting = new LightingRig(scene, renderer, camera, timecycle, { weather: 'EXTRASUNNY', hour: 12 });
+const grading = new GradePipeline(renderer, scene, camera);
 
 // GTA IV bakes prelighting into COLOR_0 and the extractor writes it into every
 // GLB. GLTFLoader already switches vertexColors on by itself whenever a
@@ -345,6 +349,7 @@ function refreshLightingLabel() {
 ui.hour.addEventListener('input', () => { lighting.setHour(Number(ui.hour.value)); refreshLightingLabel(); });
 ui.weather.addEventListener('change', () => { lighting.setWeather(ui.weather.value); refreshLightingLabel(); });
 ui.baked.addEventListener('change', () => { bakedLighting = ui.baked.checked; refreshBakedLighting(); });
+ui.grade.addEventListener('change', () => { grading.enabled = ui.grade.checked; });
 refreshLightingLabel();
 
 ui.buttons.forEach(button => button.addEventListener('click', () => setMode(button.dataset.mode)));
@@ -369,6 +374,8 @@ globalThis.gta4map = {
   setHour: hour => { lighting.setHour(hour); ui.hour.value = hour; refreshLightingLabel(); },
   setWeather: name => { lighting.setWeather(name); ui.weather.value = name; refreshLightingLabel(); },
   setBakedLighting: enabled => { bakedLighting = ui.baked.checked = enabled; refreshBakedLighting(); },
+  setGrade: enabled => { grading.enabled = ui.grade.checked = enabled; },
+  grading,
   getState: () => ({
     ready: initialized,
     mode,
@@ -376,11 +383,16 @@ globalThis.gta4map = {
       hour: lighting.hour,
       weather: lighting.weather,
       baked: bakedLighting,
-      exposure: renderer.toneMappingExposure,
+      exposure: lighting.exposure,
       sun: lighting.sunDir.toArray(),
       sunIntensity: lighting.sun.intensity,
       ambientIntensity: lighting.ambient.intensity,
       fogDensity: lighting.scene.fog.density,
+      grade: grading.enabled,
+      bloom: [grading.bloom.threshold, grading.bloom.strength],
+      colourCorrect: lighting.frame.colourCorrect,
+      desaturation: [lighting.frame.desaturation, lighting.frame.desaturationFar],
+      depthFx: [lighting.frame.depthFxNear, lighting.frame.depthFxFar],
     },
     loadedSectors: [...loaded.keys()],
     // Sectors whose geometry is in the scene but whose textures are still being
@@ -400,11 +412,15 @@ function frame() {
   lighting.follow();
   streamTimer -= dt;
   if (streamTimer <= 0) { streamTimer = 1.2; streamSectors(); }
-  renderer.render(scene, camera);
+  // A handful of uniform writes, so it is cheaper than tracking when the
+  // keyframe or the toggle last changed.
+  grading.update(lighting.frame, lighting.exposure);
+  grading.render();
 }
 frame();
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
+  grading.setSize(innerWidth, innerHeight);
 });

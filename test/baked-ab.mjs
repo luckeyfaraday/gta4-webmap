@@ -19,7 +19,7 @@ await mkdir('artifacts/baked', { recursive: true });
 const browser = await chromium.launch({ executablePath, headless: true });
 const page = await browser.newPage({ viewport: { width: 1280, height: 720 }, deviceScaleFactor: 1 });
 try {
-  await page.goto(process.env.MAP_URL ?? 'http://127.0.0.1:4176', { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  await page.goto(process.env.MAP_URL ?? 'http://127.0.0.1:4174', { waitUntil: 'domcontentloaded', timeout: 30_000 });
   await page.waitForFunction(() => globalThis.gta4map?.getState().ready, null, { timeout: 300_000 });
   await page.waitForFunction(() => globalThis.gta4map.getState().pendingSectors.length === 0, null, { timeout: 300_000 });
 
