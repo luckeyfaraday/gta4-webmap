@@ -86,10 +86,10 @@ const loading = new Map();
 const keys = new Set();
 const timer = new THREE.Timer();
 const down = new THREE.Vector3(0, -1, 0);
+const probeOrigin = new THREE.Vector3();
 const raycaster = new THREE.Raycaster();
 let mode = 'overview';
 let verticalVelocity = 0;
-let groundTimer = 0;
 let fallTimer = 0;
 let streamTimer = 0;
 let initialized = false;
@@ -109,6 +109,9 @@ const GAITS = [
 ];
 const EYE_HEIGHT = 1.62;
 const CAMERA_DISTANCE = 3.9;
+// Probing from above his feet lets a kerb or a step within this height read as
+// ground to walk up onto rather than a gap to fall into.
+const STEP_HEIGHT = 0.45;
 // Which way the bind pose faces. The export cancels each clip's own opening
 // yaw, so this single constant aligns the model with the direction the
 // controller thinks it is walking. Calibrated against the eye joints, which
@@ -481,32 +484,46 @@ function moveWalk(dt) {
 
   verticalVelocity -= 22 * dt;
   player.position.y += verticalVelocity * dt;
-  groundTimer -= dt;
-  if (groundTimer <= 0) {
-    groundTimer = 0.08;
-    raycaster.set(new THREE.Vector3(player.position.x, player.position.y + 3, player.position.z), down);
-    raycaster.near = 0;
-    raycaster.far = Math.max(12, Math.abs(verticalVelocity) * 0.25 + 8);
-    const hit = raycaster.intersectObjects(colliders, false)[0];
-    if (hit && player.position.y <= hit.point.y && verticalVelocity <= 0) {
-      if (!player.grounded) landTimer = 0.32;
-      player.position.y = hit.point.y;
-      verticalVelocity = keys.has('Space') ? 6.4 : 0;
-      player.grounded = verticalVelocity === 0;
-      fallTimer = 0;
-    } else if (verticalVelocity < 0) {
-      // No ground within the short probe. Streaming gaps and teleports can drop
-      // the player out of the world entirely, so recover after a brief fall.
-      player.grounded = false;
-      fallTimer += 0.08;
-      if (fallTimer > 1.2) snapToGround();
-    }
+
+  // Ground contact is resolved every frame. Probing on a timer instead let a
+  // frame's worth of gravity accumulate between corrections, which showed up as
+  // the character (and the camera following him) vibrating on flat ground.
+  const hit = groundProbe(dt);
+  // Ground counts as underfoot if it is no further below him than this frame's
+  // fall: walking down a slope, gravity puts him a couple of centimetres above
+  // the next step before the probe runs, and testing only for "at or below the
+  // ground" read each of those frames as a fall and a fresh landing.
+  const fellThisFrame = Math.max(0, -verticalVelocity) * dt;
+  if (hit && verticalVelocity <= 0 && player.position.y <= hit.point.y + fellThisFrame) {
+    if (!player.grounded) landTimer = 0.32;
+    player.position.y = hit.point.y;
+    verticalVelocity = keys.has('Space') ? 6.4 : 0;
+    player.grounded = verticalVelocity === 0;
+    fallTimer = 0;
+  } else if (verticalVelocity < 0) {
+    // Streaming gaps and teleports can drop the player out of the world
+    // entirely, so recover after a brief fall.
+    player.grounded = false;
+    fallTimer += dt;
+    if (fallTimer > 1.2) snapToGround();
   }
 
   carrier.position.copy(player.position);
   carrier.rotation.y = player.yaw + MODEL_YAW_OFFSET;
   updateFollowCamera();
   updateAnimation(dt);
+}
+
+// Looks for ground from STEP_HEIGHT above his feet with a probe just long enough
+// to cover this frame's fall, so a running stride stays in contact instead of
+// registering as a series of little jumps and landings.
+function groundProbe(dt) {
+  if (!colliders.length) return null;
+  probeOrigin.set(player.position.x, player.position.y + STEP_HEIGHT, player.position.z);
+  raycaster.set(probeOrigin, down);
+  raycaster.near = 0;
+  raycaster.far = STEP_HEIGHT + Math.max(1, Math.abs(verticalVelocity) * dt * 2 + 0.5);
+  return raycaster.intersectObjects(colliders, false)[0] ?? null;
 }
 
 // Picks a clip from what the character is actually doing. Playback rate is

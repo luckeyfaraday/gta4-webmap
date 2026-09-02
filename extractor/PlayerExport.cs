@@ -33,6 +33,20 @@ static class PlayerExport
     // jump_std holds the takeoff/in-air/landing chain.
     private static readonly string[] AnimationWads = { "move_player.wad", "jump_std.wad" };
 
+    // No clip drives the arm roll bones — GTA IV solves them at runtime, and
+    // leaving them at the bind pose shears the skin around the elbow and
+    // shoulder as the arm turns. Each roll bone takes a share of the twist its
+    // driver picked up, about the driver's own length axis, exactly as
+    // PedTwistSolver does. Since it is a function of the animated pose, it can
+    // be solved once here rather than every frame in the browser.
+    private static readonly (int Twist, int Driver, float X, float Y, float Z)[] TwistBones =
+    {
+        (14497, 1218, 0, 0, 1),  // Char_L_ForeTwist   <- Char_L_Forearm
+        (14496, 1217, 1, 0, 0),  // L_UpperArmRoll     <- Char_L_UpperArm
+        (14753, 1225, 0, 0, 1),  // Char_R_ForeTwist   <- Char_R_Forearm
+        (14752, 1224, 1, 0, 0),  // R_UpperArmRoll     <- Char_R_UpperArm
+    };
+
     // RAGE is Z-up right-handed, glTF is Y-up right-handed. This is the proper
     // (determinant +1) conversion, so bone rotations convert as real
     // quaternions and triangle winding is preserved. Program.cs maps the world
@@ -179,6 +193,33 @@ static class PlayerExport
         finally { img.Close(); }
     }
 
+    // Which skeleton bones a clip leaves at the bind pose. GTA IV solves some of
+    // them procedurally at runtime rather than storing tracks for them.
+    private static void ProbeUndriven(string gameDir, string wadName, string clipName, ResourceSkeleton skeleton)
+    {
+        var img = new IMGFileSystem();
+        img.Open(Path.Combine(gameDir, AnimImg.Replace('/', Path.DirectorySeparatorChar)));
+        try
+        {
+            var entry = img.GetAllFiles().FirstOrDefault(file => string.Equals(file.Name, wadName, StringComparison.OrdinalIgnoreCase));
+            if (entry == null) return;
+            using var dictionary = new AnimationDictionaryFile();
+            dictionary.Open(new MemoryStream(entry.GetData(), writable: false));
+            foreach (var clip in dictionary.File.Data.Entries)
+            {
+                if (clip == null || CleanClipName(clip.Name) != clipName) continue;
+                var driven = clip.Tracks.Where(track => track != null && track.TrackType == 1).Select(track => (int)track.BoneId).ToHashSet();
+                var missing = new List<string>();
+                for (var i = 0; i < skeleton.Bones.Count; i++)
+                    if (!driven.Contains(skeleton.Bones[i].BoneID)) missing.Add($"{skeleton.Bones[i].Name}({skeleton.Bones[i].BoneID})");
+                Console.WriteLine($"{clipName}: {driven.Count} bones driven, {missing.Count} left at bind pose");
+                Console.WriteLine("  " + string.Join(", ", missing));
+                return;
+            }
+        }
+        finally { img.Close(); }
+    }
+
     public static int Probe(string gameDir)
     {
         ProbeClip(gameDir, "move_player.wad", "walk");
@@ -186,6 +227,7 @@ static class PlayerExport
         var files = OpenPlayerArchive(gameDir, out var archive);
         try
         {
+            ProbeUndriven(gameDir, "move_player.wad", "walk", ReadSkeleton(files["player.wft"].GetData()));
             var skeleton = ReadSkeleton(files["player.wft"].GetData());
             Console.WriteLine($"player.wft: {skeleton.Bones.Count} bones");
             var conjugated = StoredRotationIsConjugated(skeleton, out var asStored, out var asConjugated);
@@ -325,6 +367,9 @@ static class PlayerExport
             // position, in RAGE coordinates.
             var rootBone = skeleton.Bones[0];
             var rootRest = (rootBone.Position.X, rootBone.Position.Y, rootBone.Position.Z);
+            var restByBoneId = new Dictionary<int, Quat>();
+            foreach (var bone in skeleton.Bones)
+                restByBoneId.TryAdd(bone.BoneID, new Quat(bone.RotationQuaternion.X, bone.RotationQuaternion.Y, bone.RotationQuaternion.Z, bone.RotationQuaternion.W).Normalized());
             var clipInfo = new List<Dictionary<string, object>>();
             var animationImg = new IMGFileSystem();
             animationImg.Open(Path.Combine(gameDir, AnimImg.Replace('/', Path.DirectorySeparatorChar)));
@@ -340,7 +385,7 @@ static class PlayerExport
                     var added = 0;
                     for (var i = 0; i < clips.Entries.Count; i++)
                     {
-                        var info = AddAnimation(writer, clips.Entries[i], boneIdToNode, boneNodes[0], rootRest);
+                        var info = AddAnimation(writer, clips.Entries[i], boneIdToNode, boneNodes[0], rootRest, restByBoneId);
                         if (info == null) continue;
                         info["wad"] = Path.GetFileNameWithoutExtension(wadName);
                         clipInfo.Add(info);
@@ -474,7 +519,8 @@ static class PlayerExport
     // the same way PedAnimationSystem applies it: x/y absolute over the rest
     // position, z relative to the clip's first frame.
     private static Dictionary<string, object> AddAnimation(PlayerGltfWriter writer, AnimationData clip,
-        Dictionary<int, int> boneIdToNode, int rootNode, (float X, float Y, float Z) rootRest)
+        Dictionary<int, int> boneIdToNode, int rootNode, (float X, float Y, float Z) rootRest,
+        Dictionary<int, Quat> restByBoneId)
     {
         if (clip?.Tracks == null || clip.NumFrames < 2 || clip.Duration <= 0) return null;
         var frames = clip.NumFrames;
@@ -490,6 +536,9 @@ static class PlayerExport
         // start a quarter-turn apart. Reporting each clip's opening root yaw
         // lets the viewer cancel that instead of snapping on every crossfade.
         double? rootYaw = null;
+        // Kept in RAGE space so the twist solver below can work in the same
+        // frame the twist axes are expressed in.
+        var rageRotations = new Dictionary<int, Quat[]>();
 
         foreach (var track in clip.Tracks)
         {
@@ -504,8 +553,13 @@ static class PlayerExport
                 var z = sources[2].GetValues(frames);
                 var w = sources[3].GetValues(frames);
                 var rotations = new Quat[frames];
+                var rage = new Quat[frames];
                 for (var frame = 0; frame < frames; frame++)
-                    rotations[frame] = ToGltf(new Quat(x[frame], y[frame], z[frame], w[frame]).Normalized());
+                {
+                    rage[frame] = new Quat(x[frame], y[frame], z[frame], w[frame]).Normalized();
+                    rotations[frame] = ToGltf(rage[frame]);
+                }
+                rageRotations[track.BoneId] = rage;
 
                 // The clips do not agree on which way the body starts facing:
                 // idle opens square while every locomotion clip opens about
@@ -573,6 +627,43 @@ static class PlayerExport
             }
         }
 
+        // Fill in the roll bones the clip does not drive.
+        var solved = 0;
+        foreach (var (twistId, driverId, axisX, axisY, axisZ) in TwistBones)
+        {
+            if (rageRotations.ContainsKey(twistId)) continue;
+            if (!rageRotations.TryGetValue(driverId, out var driver)) continue;
+            if (!boneIdToNode.TryGetValue(twistId, out var node)) continue;
+            if (!restByBoneId.TryGetValue(driverId, out var driverRest)) continue;
+            if (!restByBoneId.TryGetValue(twistId, out var twistRest)) continue;
+
+            var values = new float[frames * 4];
+            var previous = Quat.Identity;
+            for (var frame = 0; frame < frames; frame++)
+            {
+                var delta = Quat.Multiply(driver[frame], driverRest.Conjugate());
+                var twist = TwistAbout(delta, axisX, axisY, axisZ);
+                var rotation = ToGltf(Quat.Multiply(twistRest, twist).Normalized());
+                if (frame > 0 && previous.X * rotation.X + previous.Y * rotation.Y + previous.Z * rotation.Z + previous.W * rotation.W < 0)
+                    rotation = new Quat(-rotation.X, -rotation.Y, -rotation.Z, -rotation.W);
+                previous = rotation;
+                values[frame * 4] = rotation.X; values[frame * 4 + 1] = rotation.Y;
+                values[frame * 4 + 2] = rotation.Z; values[frame * 4 + 3] = rotation.W;
+            }
+            samplers.Add(new Dictionary<string, object>
+            {
+                ["input"] = timeAccessor,
+                ["output"] = writer.AddFloatAccessor(values, 4, false, vertexData: false),
+                ["interpolation"] = "LINEAR",
+            });
+            channels.Add(new Dictionary<string, object>
+            {
+                ["sampler"] = samplers.Count - 1,
+                ["target"] = new Dictionary<string, object> { ["node"] = node, ["path"] = "rotation" },
+            });
+            solved++;
+        }
+
         if (channels.Count == 0) return null;
         var name = CleanClipName(clip.Name);
         writer.AddAnimation(name, channels, samplers);
@@ -582,6 +673,7 @@ static class PlayerExport
             ["duration"] = clip.Duration,
             ["frames"] = (int)frames,
             ["mover"] = hasMover,
+            ["solvedTwistBones"] = solved,
             // The opening yaw that was cancelled out of the root track, kept for
             // reference. null when the clip has no root rotation track at all,
             // which is not the same as one that already opened square.
@@ -597,6 +689,18 @@ static class PlayerExport
         if (slash >= 0) name = name[(slash + 1)..];
         var dot = name.LastIndexOf('.');
         return dot > 0 ? name[..dot] : name;
+    }
+
+    // The part of a rotation that spins about the given axis, with the swing
+    // discarded — the swing-twist decomposition PedTwistSolver uses.
+    private static Quat TwistAbout(Quat q, float axisX, float axisY, float axisZ)
+    {
+        var projection = q.X * axisX + q.Y * axisY + q.Z * axisZ;
+        var twist = new Quat(axisX * projection, axisY * projection, axisZ * projection, q.W);
+        var length = MathF.Sqrt(twist.X * twist.X + twist.Y * twist.Y + twist.Z * twist.Z + twist.W * twist.W);
+        if (length < 1e-4f) return Quat.Identity;
+        twist = new Quat(twist.X / length, twist.Y / length, twist.Z / length, twist.W / length);
+        return twist.W < 0 ? new Quat(-twist.X, -twist.Y, -twist.Z, -twist.W) : twist;
     }
 
     // Rotation about glTF's up axis, and the quaternion that undoes it.
