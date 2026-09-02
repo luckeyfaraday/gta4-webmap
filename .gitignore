@@ -14,3 +14,7 @@ artifacts/
 # RageLib under converter/Assets/Scripts is compiled into the extractor by
 # path, so worktrees junction this directory rather than copying it.
 converter/
+
+# Generated from pc/data/timecyc.dat by `npm run extract:timecyc`. Rockstar
+# data, so it stays local like web/assets.
+web/data/

@@ -29,6 +29,11 @@
     button, select { border: 1px solid #ffffff24; background: #ffffff0b; color: #dce8ee; padding: 7px 8px; font: inherit; cursor: pointer; }
     button.active { border-color: #83d9e8; color: #83d9e8; background: #83d9e812; }
     select { width: 100%; margin-bottom: 10px; color-scheme: dark; }
+    .sep { margin: 12px 0 6px; padding-top: 10px; border-top: 1px solid #ffffff1c; font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: #6f8697; }
+    .panel .row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 3px 0; font-size: 12px; color: #91a9b8; }
+    .panel .row label { white-space: nowrap; }
+    input[type=range] { display: block; width: 100%; margin: 2px 0 10px; accent-color: #83d9e8; background: none; border: 0; padding: 0; }
+    input[type=checkbox] { accent-color: #83d9e8; margin: 0; }
     .crosshair { position: absolute; left: 50%; top: 50%; width: 5px; height: 5px; margin: -2px; border: 1px solid #fff; border-radius: 50%; opacity: 0; }
     .crosshair.visible { opacity: .8; }
   </style>
@@ -45,6 +50,12 @@
       <div class="modes"><button class="active" data-mode="overview">Overview</button><button data-mode="fly">Fly</button><button data-mode="walk">Walk</button></div>
       <select id="sector-select" aria-label="Jump to sector"></select>
       <div><span>Mode</span><b id="mode">Overview</b></div><div><span>Loaded sectors</span><b id="sectors">0</b></div><div><span>Placements</span><b id="placements">—</b></div><div><span>Models</span><b id="models">—</b></div><div><span>Textures</span><b id="textures">0</b></div>
+      <div class="sep">Timecycle · pc/data/timecyc.dat</div>
+      <div class="row"><label for="hour">Time</label><b id="hour-label">12:00</b></div>
+      <input type="range" id="hour" min="0" max="24" step="0.25" value="12" aria-label="Time of day">
+      <div class="row"><label for="weather">Weather</label></div>
+      <select id="weather" aria-label="Weather"></select>
+      <div class="row"><label for="baked">Baked vertex AO</label><input type="checkbox" id="baked" checked></div>
     </div>
     <div class="loading" id="loading"><h1>Loading Liberty City</h1><p id="status">Preparing geometry…</p><div class="track"><div class="bar" id="bar"></div></div></div>
   </div>
