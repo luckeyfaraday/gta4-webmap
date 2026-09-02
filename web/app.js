@@ -4,11 +4,13 @@ import { PointerLockControls } from 'three/addons/controls/PointerLockControls.j
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DDSLoader } from 'three/addons/loaders/DDSLoader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+import { loadPlayer } from './player-model.js';
 
 const ui = {
   loading: document.querySelector('#loading'), status: document.querySelector('#status'), bar: document.querySelector('#bar'),
   mode: document.querySelector('#mode'), sectors: document.querySelector('#sectors'), placements: document.querySelector('#placements'),
   models: document.querySelector('#models'), textures: document.querySelector('#textures'), sectorSelect: document.querySelector('#sector-select'),
+  clip: document.querySelector('#clip'),
   buttons: [...document.querySelectorAll('[data-mode]')], crosshair: document.querySelector('#crosshair'),
 };
 
@@ -57,11 +59,100 @@ let fallTimer = 0;
 let streamTimer = 0;
 let initialized = false;
 
+// Walk mode drives Niko and follows him; the camera is no longer the player.
+// Speeds are tuning constants rather than extracted data: GTA IV's locomotion
+// clips run in place and the travel speeds that go with them live in
+// move-blend data the archives do not carry.
+const GAITS = [
+  { clip: 'idle', speed: 0 },
+  { clip: 'walk', speed: 1.55 },
+  { clip: 'run', speed: 4.2 },
+  { clip: 'sprint', speed: 6.4 },
+];
+const EYE_HEIGHT = 1.62;
+const CAMERA_DISTANCE = 3.9;
+// Which way the bind pose faces. The export cancels each clip's own opening
+// yaw, so this single constant aligns the model with the direction the
+// controller thinks it is walking. Calibrated against the eye joints, which
+// getState reports as `facing` so a regression shows up as a failing test
+// rather than a character who runs sideways.
+const MODEL_YAW_OFFSET = Math.PI / 2;
+
+const player = {
+  position: new THREE.Vector3(),
+  yaw: 0,
+  speed: 0,
+  grounded: false,
+  thirdPerson: true,
+};
+// Camera orbit around the player, driven by the mouse while pointer-locked.
+const view = { yaw: 0, pitch: -0.12 };
+const focus = new THREE.Vector3();
+const cameraOffset = new THREE.Vector3();
+let landTimer = 0;
+let animState = 'idle';
+
 for (const sector of world.sectors) {
   const option = document.createElement('option');
   option.value = sector.id;
   option.textContent = `${sector.region.toUpperCase()} · ${sector.id}`;
   ui.sectorSelect.append(option);
+}
+
+// Run `npm run extract:player` to produce this. Without it the viewer still
+// works, it just walks the city as a disembodied camera.
+const character = await loadPlayer('./assets/player/player.gltf', renderer).catch(error => {
+  console.warn('Player model unavailable; walk mode stays first-person.', error);
+  return null;
+});
+if (!character) player.thirdPerson = false;
+
+// The character keeps its own node so the map's mirrored world stays a detail
+// of the model rather than something every transform has to undo: app-side
+// position and facing go on the carrier, the mirror stays inside.
+const carrier = new THREE.Group();
+if (character) {
+  // Program.cs exports the world through (-x, z, -y), a reflection. The
+  // character is exported with the proper conversion, so mirror it to match.
+  character.root.scale.x = -1;
+  carrier.add(character.root);
+  carrier.visible = false;
+  scene.add(carrier);
+}
+
+// Where the character is actually looking, measured from the skeleton rather
+// than assumed: the eyes sit ahead of the head joint, and their midpoint
+// survives the mirror that left and right individually do not.
+const headBone = character?.root.getObjectByName('Char_Head');
+const eyeBones = ['l_EyeJnt', 'r_EyeJnt'].map(name => character?.root.getObjectByName(name)).filter(Boolean);
+
+function facingVector() {
+  if (!headBone || eyeBones.length !== 2) return null;
+  const eyes = new THREE.Vector3();
+  for (const bone of eyeBones) eyes.add(bone.getWorldPosition(new THREE.Vector3()));
+  eyes.multiplyScalar(0.5).sub(headBone.getWorldPosition(new THREE.Vector3()));
+  eyes.y = 0;
+  return eyes.lengthSq() ? eyes.normalize() : null;
+}
+
+const mixer = character ? new THREE.AnimationMixer(character.root) : null;
+const actions = new Map(character?.clips.map(clip => [clip.name, mixer.clipAction(clip)]) ?? []);
+let currentAction = null;
+
+// Crossfades rather than cuts: every clip now starts from the same facing, so
+// blending two of them no longer swings the body through the difference.
+function setClip(name, { fade = 0.18, loop = true, timeScale = 1 } = {}) {
+  const next = actions.get(name);
+  if (!next) return;
+  next.timeScale = timeScale;
+  if (next === currentAction) return;
+  next.reset();
+  next.setLoop(loop ? THREE.LoopRepeat : THREE.LoopOnce, loop ? Infinity : 1);
+  next.clampWhenFinished = !loop;
+  next.play();
+  if (currentAction) currentAction.crossFadeTo(next, fade, false);
+  currentAction = next;
+  animState = name;
 }
 
 function centerOf(sector) {
@@ -172,7 +263,9 @@ function unloadSector(id) {
 }
 
 async function streamSectors(force = false) {
-  const reference = mode === 'overview' ? orbit.target : camera.position;
+  // In walk mode the camera trails the character, so stream around the
+  // character rather than around the lens.
+  const reference = mode === 'overview' ? orbit.target : mode === 'walk' ? player.position : camera.position;
   const ranked = [...world.sectors].sort((a, b) => distanceToSector(reference, a) - distanceToSector(reference, b));
   const wanted = new Set(ranked.slice(0, 4).map(sector => sector.id));
   if (force && ui.sectorSelect.value) wanted.add(ui.sectorSelect.value);
@@ -199,30 +292,79 @@ function updateStats() {
 function setMode(next) {
   mode = next;
   orbit.enabled = next === 'overview';
+  // PointerLockControls steers the camera itself, which is right for fly but
+  // fights the follow camera in walk mode, where the mouse orbits the player.
+  pointer.enabled = next === 'fly';
   ui.mode.textContent = next[0].toUpperCase() + next.slice(1);
   ui.crosshair.classList.toggle('visible', next !== 'overview');
+  carrier.visible = next === 'walk' && player.thirdPerson;
   for (const button of ui.buttons) button.classList.toggle('active', button.dataset.mode === next);
-  if (next === 'walk') { verticalVelocity = 0; fallTimer = 0; snapToGround(); }
+  if (next === 'walk') {
+    // Entering from another mode, the player starts wherever the camera was.
+    player.position.copy(camera.position);
+    player.position.y -= EYE_HEIGHT;
+    const heading = new THREE.Vector3();
+    camera.getWorldDirection(heading);
+    view.yaw = Math.atan2(-heading.x, -heading.z);
+    player.yaw = view.yaw;
+    verticalVelocity = 0;
+    fallTimer = 0;
+    landTimer = 0;
+    snapToGround();
+    updateFollowCamera();
+  }
   if (next === 'overview') pointer.unlock();
   else pointer.lock();
 }
 
-// Casts from above the tallest loaded sector rather than from the camera, so it
-// still recovers when the player has already fallen below the map.
+// Casts from above the tallest loaded sector rather than from the character, so
+// it still recovers when they have already fallen below the map.
 function snapToGround() {
   const meshes = [...loaded.values()].flatMap(record => record.meshes);
   if (!meshes.length) return false;
-  let top = camera.position.y;
+  let top = player.position.y;
   for (const { sector } of loaded.values()) top = Math.max(top, sector.bounds.max[1]);
-  raycaster.set(new THREE.Vector3(camera.position.x, top + 100, camera.position.z), down);
+  raycaster.set(new THREE.Vector3(player.position.x, top + 100, player.position.z), down);
   raycaster.near = 0;
-  raycaster.far = (top + 100) - camera.position.y + 2500;
+  raycaster.far = (top + 100) - player.position.y + 2500;
   const hit = raycaster.intersectObjects(meshes, false)[0];
   if (!hit) return false;
-  camera.position.y = hit.point.y + 1.75;
+  player.position.y = hit.point.y;
   verticalVelocity = 0;
   fallTimer = 0;
+  player.grounded = true;
   return true;
+}
+
+// Third person orbits the character; first person drops the lens to eye level
+// and hides him. Both share one yaw/pitch so switching does not jump the view.
+function updateFollowCamera() {
+  focus.copy(player.position);
+  focus.y += EYE_HEIGHT;
+  if (!player.thirdPerson) {
+    camera.position.copy(focus);
+    camera.lookAt(
+      focus.x - Math.sin(view.yaw) * Math.cos(view.pitch),
+      focus.y + Math.sin(view.pitch),
+      focus.z - Math.cos(view.yaw) * Math.cos(view.pitch));
+    return;
+  }
+  cameraOffset.set(
+    Math.sin(view.yaw) * Math.cos(view.pitch),
+    Math.sin(view.pitch),
+    Math.cos(view.yaw) * Math.cos(view.pitch));
+  let distance = CAMERA_DISTANCE;
+  const meshes = [...loaded.values()].flatMap(record => record.meshes);
+  if (meshes.length) {
+    // Pull in rather than let the camera sink through whatever is behind him.
+    raycaster.set(focus, cameraOffset);
+    raycaster.near = 0;
+    raycaster.far = CAMERA_DISTANCE + 0.4;
+    const hit = raycaster.intersectObjects(meshes, false)[0];
+    if (hit) distance = Math.max(0.65, hit.distance - 0.35);
+  }
+  camera.position.copy(focus).addScaledVector(cameraOffset, distance);
+  camera.lookAt(focus);
 }
 
 function teleport(sector) {
@@ -230,6 +372,7 @@ function teleport(sector) {
   camera.position.copy(center).add(new THREE.Vector3(0, 230, 260));
   orbit.target.copy(center);
   orbit.update();
+  player.position.copy(center);
   verticalVelocity = 0;
   fallTimer = 0;
   loadSector(sector).then(() => {
@@ -242,10 +385,14 @@ function teleport(sector) {
 
 function movePlayer(dt) {
   if (mode === 'overview') { orbit.update(); return; }
-  const speed = mode === 'fly' ? (keys.has('ShiftLeft') ? 260 : 85) : (keys.has('ShiftLeft') ? 13 : 6.5);
+  if (mode === 'fly') { moveFly(dt); return; }
+  moveWalk(dt);
+}
+
+function moveFly(dt) {
+  const speed = keys.has('ShiftLeft') ? 260 : 85;
   const forward = new THREE.Vector3();
   camera.getWorldDirection(forward);
-  if (mode === 'walk') { forward.y = 0; forward.normalize(); }
   const right = new THREE.Vector3().crossVectors(forward, camera.up).normalize();
   const movement = new THREE.Vector3();
   if (keys.has('KeyW')) movement.add(forward);
@@ -253,40 +400,105 @@ function movePlayer(dt) {
   if (keys.has('KeyD')) movement.add(right);
   if (keys.has('KeyA')) movement.sub(right);
   if (movement.lengthSq()) camera.position.addScaledVector(movement.normalize(), speed * dt);
+  if (keys.has('Space') || keys.has('KeyE')) camera.position.y += speed * dt;
+  if (keys.has('ControlLeft') || keys.has('KeyQ') || keys.has('KeyC')) camera.position.y -= speed * dt;
+}
 
-  if (mode === 'fly') {
-    if (keys.has('Space') || keys.has('KeyE')) camera.position.y += speed * dt;
-    if (keys.has('ControlLeft') || keys.has('KeyQ') || keys.has('KeyC')) camera.position.y -= speed * dt;
-    return;
+function moveWalk(dt) {
+  // Input is read in the camera's frame: W is always "away from the lens".
+  const forward = new THREE.Vector3(-Math.sin(view.yaw), 0, -Math.cos(view.yaw));
+  const right = new THREE.Vector3().crossVectors(forward, camera.up).normalize();
+  const movement = new THREE.Vector3();
+  if (keys.has('KeyW')) movement.add(forward);
+  if (keys.has('KeyS')) movement.sub(forward);
+  if (keys.has('KeyD')) movement.add(right);
+  if (keys.has('KeyA')) movement.sub(right);
+
+  const gait = keys.has('ShiftLeft') ? 3 : keys.has('AltLeft') ? 1 : 2;
+  const wanted = movement.lengthSq() ? GAITS[gait].speed : 0;
+  player.speed = wanted;
+  if (wanted > 0) {
+    movement.normalize();
+    player.position.addScaledVector(movement, wanted * dt);
+    // He turns to face where he is going, the way GTA IV does on foot, so the
+    // forward locomotion clips carry every direction and no strafe set is
+    // needed. Turning is rate-limited so a reversal reads as a turn.
+    const target = Math.atan2(movement.x, movement.z);
+    let delta = ((target - player.yaw + Math.PI) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) - Math.PI;
+    player.yaw += Math.max(-9 * dt, Math.min(9 * dt, delta));
   }
 
   verticalVelocity -= 22 * dt;
-  camera.position.y += verticalVelocity * dt;
+  player.position.y += verticalVelocity * dt;
   groundTimer -= dt;
   if (groundTimer <= 0) {
     groundTimer = 0.08;
-    raycaster.set(new THREE.Vector3(camera.position.x, camera.position.y + 3, camera.position.z), down);
+    raycaster.set(new THREE.Vector3(player.position.x, player.position.y + 3, player.position.z), down);
     raycaster.near = 0;
     raycaster.far = Math.max(12, Math.abs(verticalVelocity) * 0.25 + 8);
     const meshes = [...loaded.values()].flatMap(record => record.meshes);
     const hit = raycaster.intersectObjects(meshes, false)[0];
-    if (hit && camera.position.y <= hit.point.y + 1.75 && verticalVelocity <= 0) {
-      camera.position.y = hit.point.y + 1.75;
-      verticalVelocity = keys.has('Space') ? 8 : 0;
+    if (hit && player.position.y <= hit.point.y && verticalVelocity <= 0) {
+      if (!player.grounded) landTimer = 0.32;
+      player.position.y = hit.point.y;
+      verticalVelocity = keys.has('Space') ? 6.4 : 0;
+      player.grounded = verticalVelocity === 0;
       fallTimer = 0;
     } else if (verticalVelocity < 0) {
       // No ground within the short probe. Streaming gaps and teleports can drop
       // the player out of the world entirely, so recover after a brief fall.
+      player.grounded = false;
       fallTimer += 0.08;
       if (fallTimer > 1.2) snapToGround();
     }
   }
+
+  carrier.position.copy(player.position);
+  carrier.rotation.y = player.yaw + MODEL_YAW_OFFSET;
+  updateFollowCamera();
+  updateAnimation(dt);
+}
+
+// Picks a clip from what the character is actually doing. Playback rate is
+// scaled by how far his real speed is from the gait the clip was authored for,
+// which is what keeps his feet off the ice.
+function updateAnimation(dt) {
+  if (!mixer) return;
+  landTimer = Math.max(0, landTimer - dt);
+
+  if (!player.grounded && verticalVelocity > 0.5) setClip('jump_takeoff_r', { fade: 0.08, loop: false });
+  else if (!player.grounded) setClip('jump_inair_r', { fade: 0.12 });
+  else if (landTimer > 0) setClip('jump_land_r', { fade: 0.08, loop: false });
+  else if (player.speed < 0.1) setClip('idle', { fade: 0.22 });
+  else {
+    let gait = GAITS[1];
+    for (const candidate of GAITS) if (candidate.speed > 0 && player.speed >= candidate.speed - 0.01) gait = candidate;
+    setClip(gait.clip, { fade: 0.18, timeScale: THREE.MathUtils.clamp(player.speed / gait.speed, 0.6, 1.6) });
+  }
+  ui.clip.textContent = animState;
+  mixer.update(dt);
 }
 
 ui.buttons.forEach(button => button.addEventListener('click', () => setMode(button.dataset.mode)));
 renderer.domElement.addEventListener('click', () => { if (mode !== 'overview' && !pointer.isLocked) pointer.lock(); });
 ui.sectorSelect.addEventListener('change', () => teleport(world.sectors.find(sector => sector.id === ui.sectorSelect.value)));
-addEventListener('keydown', event => { keys.add(event.code); if (event.code === 'KeyF') setMode(mode === 'fly' ? 'walk' : 'fly'); });
+
+// Walk mode orbits the character instead of turning the camera in place, so it
+// takes the mouse itself rather than leaving it to PointerLockControls.
+addEventListener('mousemove', event => {
+  if (mode !== 'walk' || !pointer.isLocked) return;
+  view.yaw -= event.movementX * 0.0022;
+  view.pitch = THREE.MathUtils.clamp(view.pitch - event.movementY * 0.0018, -0.95, 0.75);
+});
+
+addEventListener('keydown', event => {
+  keys.add(event.code);
+  if (event.code === 'KeyF') setMode(mode === 'fly' ? 'walk' : 'fly');
+  if (event.code === 'KeyV' && mode === 'walk' && character) {
+    player.thirdPerson = !player.thirdPerson;
+    carrier.visible = player.thirdPerson;
+  }
+});
 addEventListener('keyup', event => keys.delete(event.code));
 addEventListener('blur', () => keys.clear());
 
@@ -301,7 +513,7 @@ setTimeout(() => { ui.loading.classList.add('done'); setTimeout(() => ui.loading
 streamSectors(true);
 
 globalThis.gta4map = {
-  scene, camera, renderer, world, setMode,
+  scene, camera, renderer, world, setMode, character,
   getState: () => ({
     ready: initialized,
     mode,
@@ -312,6 +524,18 @@ globalThis.gta4map = {
     sectors: world.sectors.length,
     textures: textureCache.size,
     camera: camera.position.toArray(),
+    player: character ? {
+      position: player.position.toArray(),
+      yaw: player.yaw,
+      speed: player.speed,
+      grounded: player.grounded,
+      visible: carrier.visible,
+      thirdPerson: player.thirdPerson,
+      clip: animState,
+      clips: character.clips.length,
+      bones: character.bones,
+      facing: facingVector()?.toArray() ?? null,
+    } : null,
   }),
 };
 

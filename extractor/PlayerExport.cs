@@ -503,11 +503,30 @@ static class PlayerExport
                 var y = sources[1].GetValues(frames);
                 var z = sources[2].GetValues(frames);
                 var w = sources[3].GetValues(frames);
+                var rotations = new Quat[frames];
+                for (var frame = 0; frame < frames; frame++)
+                    rotations[frame] = ToGltf(new Quat(x[frame], y[frame], z[frame], w[frame]).Normalized());
+
+                // The clips do not agree on which way the body starts facing:
+                // idle opens square while every locomotion clip opens about
+                // 85 degrees round. Blending two of those against each other
+                // would swing the character through the difference, so cancel
+                // each clip's opening yaw here and let the viewer own facing
+                // entirely. Turning clips keep their turn: only the starting
+                // orientation moves.
+                if (track.BoneId == 0)
+                {
+                    rootYaw = Yaw(rotations[0]);
+                    var correction = YawQuaternion(-rootYaw.Value);
+                    for (var frame = 0; frame < frames; frame++)
+                        rotations[frame] = Quat.Multiply(correction, rotations[frame]).Normalized();
+                }
+
                 var values = new float[frames * 4];
                 var previous = Quat.Identity;
                 for (var frame = 0; frame < frames; frame++)
                 {
-                    var rotation = ToGltf(new Quat(x[frame], y[frame], z[frame], w[frame]).Normalized());
+                    var rotation = rotations[frame];
                     // Keep the sampler on one hemisphere so the viewer's linear
                     // quaternion interpolation takes the short way round.
                     if (frame > 0 && previous.X * rotation.X + previous.Y * rotation.Y + previous.Z * rotation.Z + previous.W * rotation.W < 0)
@@ -515,10 +534,6 @@ static class PlayerExport
                     previous = rotation;
                     values[frame * 4] = rotation.X; values[frame * 4 + 1] = rotation.Y;
                     values[frame * 4 + 2] = rotation.Z; values[frame * 4 + 3] = rotation.W;
-                    if (frame == 0 && track.BoneId == 0)
-                        rootYaw = Math.Atan2(
-                            2 * (rotation.W * rotation.Y + rotation.X * rotation.Z),
-                            1 - 2 * (rotation.Y * rotation.Y + rotation.Z * rotation.Z));
                 }
                 samplers.Add(new Dictionary<string, object>
                 {
@@ -567,9 +582,10 @@ static class PlayerExport
             ["duration"] = clip.Duration,
             ["frames"] = (int)frames,
             ["mover"] = hasMover,
-            // null when the clip has no root rotation track at all, which is
-            // not the same as a clip that opens facing straight ahead.
-            ["rootYaw"] = rootYaw,
+            // The opening yaw that was cancelled out of the root track, kept for
+            // reference. null when the clip has no root rotation track at all,
+            // which is not the same as one that already opened square.
+            ["rootYawRemoved"] = rootYaw,
         };
     }
 
@@ -582,6 +598,11 @@ static class PlayerExport
         var dot = name.LastIndexOf('.');
         return dot > 0 ? name[..dot] : name;
     }
+
+    // Rotation about glTF's up axis, and the quaternion that undoes it.
+    private static double Yaw(Quat q) => Math.Atan2(2 * (q.W * q.Y + q.X * q.Z), 1 - 2 * (q.Y * q.Y + q.Z * q.Z));
+
+    private static Quat YawQuaternion(double yaw) => new Quat(0, (float)Math.Sin(yaw / 2), 0, (float)Math.Cos(yaw / 2));
 
     private static void WriteMatrix(Span<float> target, Quat rotation, (float X, float Y, float Z) translation)
     {
