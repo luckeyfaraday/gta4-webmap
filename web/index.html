@@ -24,6 +24,17 @@
     .loading p { margin: 0 0 18px; color: #91a9b8; font-size: 12px; }
     .track { height: 3px; background: #ffffff14; overflow: hidden; }
     .bar { width: 2%; height: 100%; background: #83d9e8; box-shadow: 0 0 16px #83d9e8; transition: width .18s ease; }
+    .stars {
+      position: absolute; top: 24px; right: 28px;
+      font-size: 30px; letter-spacing: 4px; line-height: 1;
+      color: #ffd34d; text-shadow: 0 2px 10px #000, 0 0 18px #ffae0060;
+    }
+    .stars.cool { color: #ffd34d80; }
+    .weapon {
+      position: absolute; top: 66px; right: 28px;
+      font-size: 13px; letter-spacing: .12em; color: #e9f2f7;
+      text-shadow: 0 2px 10px #000;
+    }
     .hint { position: absolute; left: 30px; bottom: 26px; color: #90a6b4; font-size: 11px; letter-spacing: .05em; text-shadow: 0 2px 8px #000; }
     .modes { display: grid !important; grid-template-columns: repeat(3, 1fr); gap: 6px !important; margin-bottom: 10px; }
     button, select { border: 1px solid #ffffff24; background: #ffffff0b; color: #dce8ee; padding: 7px 8px; font: inherit; cursor: pointer; }
@@ -45,7 +56,9 @@
   <div class="hud">
     <div class="brand"><strong>Liberty City</strong><span>Complete outdoor map · streamed from GTA IV</span></div>
     <div class="crosshair" id="crosshair"></div>
-    <div class="hint">WASD move · mouse look · Shift sprint · Alt walk · Space jump · F fly/walk · V first/third person · Esc release mouse</div>
+    <div class="hint">WASD move · mouse look · Shift sprint · Alt walk · Space jump · F fly/walk · V first/third person · 1/2/3 weapon · 0 holster · click fire · R reload · G attack · E vehicle · Esc release mouse</div>
+    <div class="stars" id="stars" hidden></div>
+    <div class="weapon" id="weapon" hidden></div>
     <div class="panel">
       <div class="modes"><button class="active" data-mode="overview">Overview</button><button data-mode="fly">Fly</button><button data-mode="walk">Walk</button></div>
       <select id="sector-select" aria-label="Jump to sector"></select>

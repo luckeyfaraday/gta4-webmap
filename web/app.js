@@ -8,6 +8,14 @@ import { buildSector } from './sector-builder.js';
 import { Timecycle, LightingRig } from './lighting.js';
 import { GradePipeline } from './grade.js';
 import { loadPlayer } from './player-model.js';
+import { RoadGraph } from './road-graph.js';
+import { Traffic } from './traffic.js';
+import { NavPoints } from './nav-points.js';
+import { Crowd } from './crowd.js';
+import { Wanted } from './wanted.js';
+import { Police } from './police.js';
+import { Driving } from './driving.js';
+import { Weapons } from './weapons.js';
 
 const ui = {
   loading: document.querySelector('#loading'), status: document.querySelector('#status'), bar: document.querySelector('#bar'),
@@ -27,7 +35,7 @@ const ui = {
 // arrays no longer fit in dedicated VRAM. Raise these on a discrete GPU.
 // Note maxTextureEdge only applies to the per-file fallback path; bundles are
 // trimmed at pack time (tools/pack-textures.mjs --max-edge).
-const tuning = { residentSectors: 6, maxResidentSectors: 7, unloadDistance: 2200, maxTextureEdge: 256, anisotropy: 8, perObjectCull: false };
+const tuning = { residentSectors: 6, maxResidentSectors: 7, unloadDistance: 2200, maxTextureEdge: 256, anisotropy: 8, perObjectCull: false, maxVehicles: 24, maxPeds: 18 };
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
@@ -94,6 +102,10 @@ let verticalVelocity = 0;
 let fallTimer = 0;
 let unstickTimer = 0;
 let streamTimer = 0;
+// Freezes simulation while still rendering: the pose, the traffic and the crowd
+// all hold where they are and the camera can be moved without the walk
+// controller pulling it back. Used for framing shots.
+let paused = false;
 let initialized = false;
 let textureLayers = 0;
 // Rebuilt only when sectors come and go, instead of on every raycast tick.
@@ -166,6 +178,227 @@ if (!character) player.thirdPerson = false;
 // The character keeps its own node so the map's mirrored world stays a detail
 // of the model rather than something every transform has to undo: app-side
 // position and facing go on the carrier, the mirror stays inside.
+// Ambient traffic on the road graph from paths.ipl. Loaded alongside the world
+// rather than lazily, because the graph is a single 950 KB fetch and the spawn
+// loop needs it from the first frame the player moves.
+const roadGraph = await RoadGraph.load().catch(error => {
+  console.warn('Road graph unavailable, traffic disabled', error);
+  return null;
+});
+// Path node heights are not the road surface — see the note in traffic.js — so
+// traffic is given a probe against the streamed city and rides the real
+// geometry instead. Its own raycaster, because the player's is reused mid-frame.
+const trafficRay = new THREE.Raycaster();
+const probeOrigin2 = new THREE.Vector3();
+function probeRoad(x, z, yHint) {
+  if (!colliders.length) return null;
+  probeOrigin2.set(x, yHint + 6, z);
+  trafficRay.set(probeOrigin2, down);
+  trafficRay.near = 0;
+  trafficRay.far = 60;
+  const hits = trafficRay.intersectObjects(colliders, false);
+  if (!hits.length) return null;
+
+  // The surface CLOSEST to where the caller already is, not the first one the
+  // ray meets. The navmesh points carry no height — the per-tile Z base is not
+  // in the .wnv files — so a point on a bridge and a point on the street below
+  // it are the same point in plan. Taking the topmost hit drops a ped off the
+  // bridge; taking the nearest keeps whoever is up there up there.
+  let best = hits[0];
+  let bestGap = Math.abs(best.point.y - yHint);
+  for (let i = 1; i < hits.length; i++) {
+    const gap = Math.abs(hits[i].point.y - yHint);
+    if (gap < bestGap) { bestGap = gap; best = hits[i]; }
+  }
+  return best.point.y;
+}
+
+const traffic = roadGraph
+  ? await Traffic.create(roadGraph, scene, renderer, {
+      maxVehicles: tuning.maxVehicles,
+      groundProbe: probeRoad,
+    }).catch(error => {
+      console.warn('Traffic unavailable', error);
+      return null;
+    })
+  : null;
+
+// The ambient crowd walks GTA IV's own pedestrian navmesh. It carries no
+// heights — the per-tile Z base is not stored in the .wnv files — so peds share
+// the same ground probe the traffic uses.
+const navPoints = await NavPoints.load().catch(error => {
+  console.warn('Navmesh unavailable, crowd disabled', error);
+  return null;
+});
+const crowd = navPoints
+  ? await Crowd.create(navPoints, scene, renderer, {
+      maxPeds: tuning.maxPeds,
+      groundProbe: probeRoad,
+    }).catch(error => {
+      console.warn('Crowd unavailable', error);
+      return null;
+    })
+  : null;
+
+// The wanted level and the police response to it. Wanted is pure bookkeeping and
+// works with or without the world; Police needs the navmesh to move officers and
+// the road graph to move cruisers.
+const wanted = new Wanted();
+const police = navPoints
+  ? await Police.create(navPoints, roadGraph, scene, renderer, wanted, {
+      groundProbe: probeRoad,
+    }).catch(error => {
+      console.warn('Police unavailable', error);
+      return null;
+    })
+  : null;
+
+const starsHud = document.querySelector('#stars');
+function refreshStars() {
+  if (!starsHud) return;
+  const stars = wanted.stars;
+  starsHud.hidden = stars === 0;
+  starsHud.textContent = '★'.repeat(stars);
+  // Dimmed once nothing has eyes on the player, which is the cue that the
+  // level is cooling — the same signal IV gives by flashing the stars.
+  starsHud.classList.toggle('cool', !wanted.pursued);
+}
+wanted.onChange(refreshStars);
+refreshStars();
+
+// Attacking the nearest pedestrian. The viewer has no weapons, so this stands
+// in for the offence itself: it removes the ped and reports the crime, which is
+// what the wanted system and the police response actually key off.
+function attackNearestPed() {
+  if (!crowd || mode !== 'walk') return null;
+  const peds = crowd.debugPeds();
+  if (!peds.length) return null;
+  let best = null;
+  for (const ped of peds) {
+    const distance = Math.hypot(ped.position[0] - player.position.x, ped.position[2] - player.position.z);
+    if (distance < 6 && (!best || distance < best.distance)) best = { ped, distance };
+  }
+  if (!best) return null;
+  crowd.remove(best.ped.ped, player.position);
+  // Witnessed if anything is close enough to see it — other peds count as
+  // witnesses, which is why a crime in an empty street costs less.
+  const witnesses = peds.filter(other => other !== best.ped &&
+    Math.hypot(other.position[0] - player.position.x, other.position[2] - player.position.z) < 45).length;
+  wanted.report('pedKilled', { witnessed: witnesses > 0 || police?.getState().seen === true });
+  refreshStars();
+  return { ped: best.ped.ped, witnesses, stars: wanted.stars };
+}
+
+// Driving. The ground probe is the same one traffic and the crowd use; the
+// obstacle probe is a short cast along travel that stops the car rather than
+// letting it drive through a building.
+const drivingRay = new THREE.Raycaster();
+function obstacleAhead(position, forward, distance, direction) {
+  if (!colliders.length) return false;
+  const origin = new THREE.Vector3(position.x, position.y + 0.7, position.z);
+  const heading = forward.clone().multiplyScalar(direction >= 0 ? 1 : -1);
+  drivingRay.set(origin, heading);
+  drivingRay.near = 0;
+  drivingRay.far = distance;
+  const hit = drivingRay.intersectObjects(colliders, false)[0];
+  // Ignore anything low enough to be a kerb or a ramp — those are drivable.
+  return !!hit && hit.point.y > position.y + 0.45;
+}
+const driving = new Driving(scene, { groundProbe: probeRoad, obstacleProbe: obstacleAhead });
+
+// Weapons. The models and every number behind them come from the game's own
+// weapons.img and WeaponInfo.xml; the firing animations are Niko's, in a clip
+// library exported against his skeleton.
+const weapons = await Weapons.create(scene, renderer, {
+  crowd, police, wanted, groundProbe: probeRoad,
+}).catch(error => {
+  console.warn('Weapons unavailable', error);
+  return null;
+});
+const weaponHud = document.querySelector('#weapon');
+function refreshWeaponHud() {
+  if (!weaponHud) return;
+  const held = weapons?.getState().held;
+  weaponHud.hidden = !held;
+  if (held) weaponHud.textContent = `${held.type}  ${held.ammo} / ${held.reserve}`;
+}
+
+// Where a shot starts and which way it goes. In third person the camera is
+// behind the shoulder, so firing from the lens would put rounds through the
+// character's own back; shots leave from his chest along the camera's aim.
+const shotOrigin = new THREE.Vector3();
+const shotDirection = new THREE.Vector3();
+function aim() {
+  camera.getWorldDirection(shotDirection);
+  shotOrigin.copy(player.position);
+  shotOrigin.y += 1.35;
+  return { origin: shotOrigin, direction: shotDirection };
+}
+
+function fireWeapon() {
+  if (!weapons?.held || mode === 'overview') return null;
+  const { origin, direction } = aim();
+  const result = weapons.fire(origin, direction);
+  refreshWeaponHud();
+  refreshStars();
+  return result;
+}
+
+async function equipWeapon(type) {
+  if (!weapons) return null;
+  const held = await weapons.equip(type);
+  refreshWeaponHud();
+  return held ? weapons.getState().held : null;
+}
+
+
+// Getting in and out. Entering takes the nearest traffic car over as-is;
+// leaving hands it back so it rejoins the flow instead of standing abandoned.
+function enterNearestVehicle() {
+  if (mode !== 'walk' || !traffic || driving.active) return null;
+  const vehicle = traffic.takeNearest(player.position, 7);
+  if (!vehicle) return null;
+  driving.enter(vehicle, { yaw: vehicle.yaw });
+  setMode('drive');
+  return driving.getState();
+}
+
+function exitVehicle() {
+  if (!driving.active) return null;
+  const point = driving.exitPoint(new THREE.Vector3());
+  const vehicle = driving.exit();
+  if (vehicle && traffic && !traffic.give(vehicle)) {
+    // Nowhere near a road — leave it where it is rather than deleting a car the
+    // player just parked.
+  }
+  // Mode first: switching to walk seeds the player from the camera, so the
+  // exit point has to be applied after it or it is immediately overwritten.
+  setMode('walk');
+  if (point) {
+    player.position.copy(point);
+    verticalVelocity = 0;
+    snapToGround();
+    updateFollowCamera();
+  }
+  return true;
+}
+
+// Running a pedestrian down. Checked against the car's own speed, because a
+// stationary car resting against someone is not the same offence.
+function runOverPeds() {
+  if (!driving.active || !crowd) return;
+  const speed = driving.speedKmh;
+  if (speed < 12) return;
+  const position = driving.position;
+  for (const ped of crowd.debugPeds()) {
+    const distance = Math.hypot(ped.position[0] - position.x, ped.position[2] - position.z);
+    if (distance > 2.2) continue;
+    crowd.remove(ped.ped, position);
+    wanted.report('ranOverPed');
+    refreshStars();
+  }
+}
+
 const carrier = new THREE.Group();
 if (character) {
   // Program.cs exports the world through (-x, z, -y), a reflection. The
@@ -192,11 +425,27 @@ function facingVector() {
 }
 
 const mixer = character ? new THREE.AnimationMixer(character.root) : null;
+// Attached here rather than where the weapons load, because the weapon clips
+// play on the character's own mixer and it does not exist until now.
+if (weapons && character) weapons.attachTo(carrier, mixer);
 const actions = new Map(character?.clips.map(clip => [clip.name, mixer.clipAction(clip)]) ?? []);
+// The armed walk cycles live in the weapon clip library rather than in
+// player.gltf, so they are registered here alongside his own.
+if (weapons && mixer) {
+  for (const clip of weapons.locomotionClips()) actions.set(clip.name, mixer.clipAction(clip));
+}
 let currentAction = null;
 
 // Crossfades rather than cuts: every clip now starts from the same facing, so
 // blending two of them no longer swings the body through the difference.
+// A rifle or a launcher changes how he walks, and the game ships whole
+// locomotion sets for both. The pistol does not — it uses the ordinary walk,
+// as it does in GTA IV — so this returns null and the normal clip is used.
+function armedClip(gait) {
+  const clip = weapons?.baseClip(gait);
+  return clip && actions.has(clip.name) ? clip.name : null;
+}
+
 function setClip(name, { fade = 0.18, loop = true, timeScale = 1 } = {}) {
   const next = actions.get(name);
   if (!next) return;
@@ -396,6 +645,9 @@ function setMode(next) {
   pointer.enabled = next === 'fly';
   ui.mode.textContent = next[0].toUpperCase() + next.slice(1);
   ui.crosshair.classList.toggle('visible', next !== 'overview');
+  // Niko is hidden while driving: he is in the car, and the seat bones say
+  // where, but posing him in it needs a sitting clip the movement wads do not
+  // carry — those live in the amb@car_std_* set.
   carrier.visible = next === 'walk' && player.thirdPerson;
   for (const button of ui.buttons) button.classList.toggle('active', button.dataset.mode === next);
   if (next === 'walk') {
@@ -483,7 +735,44 @@ function teleport(sector) {
 function movePlayer(dt) {
   if (mode === 'overview') { orbit.update(); return; }
   if (mode === 'fly') { moveFly(dt); return; }
+  if (mode === 'drive') { moveDrive(dt); return; }
   moveWalk(dt);
+}
+
+function moveDrive(dt) {
+  if (!driving.active) { setMode('walk'); return; }
+  driving.update(dt, {
+    forward: keys.has('KeyW'),
+    back: keys.has('KeyS'),
+    left: keys.has('KeyA'),
+    right: keys.has('KeyD'),
+    handbrake: keys.has('Space'),
+  });
+  // The player rides with the car, so sector streaming and the population all
+  // follow the vehicle without any of them needing to know about driving.
+  player.position.copy(driving.position);
+  player.yaw = driving.yaw;
+  refreshNearMeshes();
+  updateChaseCamera(dt);
+}
+
+// Chase camera. It sits behind the car in the car's own frame rather than the
+// mouse's, so the view leads through a corner, and pulls back as speed rises.
+function updateChaseCamera(dt) {
+  const position = driving.position;
+  if (!position) return;
+  const back = 6.2 + Math.min(4, driving.speedKmh * 0.03);
+  const height = 2.5 + Math.min(1.2, driving.speedKmh * 0.008);
+  const yaw = driving.yaw + view.yaw * 0.35;
+  const wanted = new THREE.Vector3(
+    position.x + Math.sin(yaw) * back,
+    position.y + height,
+    position.z + Math.cos(yaw) * back,
+  );
+  // Ease rather than snap, so bumps and kerbs do not jolt the lens.
+  camera.position.lerp(wanted, Math.min(1, dt * 6));
+  focus.set(position.x, position.y + 1.1, position.z);
+  camera.lookAt(focus);
 }
 
 function moveFly(dt) {
@@ -634,11 +923,12 @@ function updateAnimation(dt) {
   if (!player.grounded && verticalVelocity > 0.5) setClip('jump_takeoff_r', { fade: 0.08, loop: false });
   else if (!player.grounded) setClip('jump_inair_r', { fade: 0.12 });
   else if (landTimer > 0) setClip('jump_land_r', { fade: 0.08, loop: false });
-  else if (player.speed < 0.1) setClip('idle', { fade: 0.22 });
+  else if (player.speed < 0.1) setClip(armedClip('idle') ?? 'idle', { fade: 0.22 });
   else {
     let gait = GAITS[1];
     for (const candidate of GAITS) if (candidate.speed > 0 && player.speed >= candidate.speed - 0.01) gait = candidate;
-    setClip(gait.clip, { fade: 0.18, timeScale: THREE.MathUtils.clamp(player.speed / gait.speed, 0.6, 1.6) });
+    setClip(armedClip(gait.clip) ?? gait.clip,
+      { fade: 0.18, timeScale: THREE.MathUtils.clamp(player.speed / gait.speed, 0.6, 1.6) });
   }
   ui.clip.textContent = animState;
   mixer.update(dt);
@@ -682,6 +972,13 @@ addEventListener('mousemove', event => {
 
 addEventListener('keydown', event => {
   keys.add(event.code);
+  if (event.code === 'Digit1') equipWeapon('PISTOL');
+  if (event.code === 'Digit2') equipWeapon('M4');
+  if (event.code === 'Digit3') equipWeapon('RLAUNCHER');
+  if (event.code === 'Digit0') { weapons?.unequip(); refreshWeaponHud(); }
+  if (event.code === 'KeyR') { weapons?.reload(); refreshWeaponHud(); }
+  if (event.code === 'KeyG') attackNearestPed();
+  if (event.code === 'KeyE') { if (driving.active) exitVehicle(); else enterNearestVehicle(); }
   if (event.code === 'KeyF') setMode(mode === 'fly' ? 'walk' : 'fly');
   if (event.code === 'KeyV' && mode === 'walk' && character) {
     player.thirdPerson = !player.thirdPerson;
@@ -701,8 +998,44 @@ ui.status.textContent = 'Ready';
 setTimeout(() => { ui.loading.classList.add('done'); setTimeout(() => ui.loading.remove(), 450); }, 250);
 streamSectors(true);
 
+addEventListener('mousedown', event => {
+  // Left button fires whatever is in hand, while the pointer is captured.
+  if (event.button !== 0 || mode === 'overview' || !weapons?.held) return;
+  fireWeapon();
+});
+
 globalThis.gta4map = {
   THREE, scene, camera, renderer, world, setMode, tuning, lighting, timecycle, character,
+  traffic, roadGraph, crowd, navPoints, wanted, police, driving,
+  enterNearestVehicle, exitVehicle,
+  weapons, equipWeapon, fireWeapon,
+  // Places the player on the ground at a point. Used for jumping around the
+  // city and by the tests, which need to stand next to a specific car.
+  setPlayerPosition: (x, y, z) => {
+    player.position.set(x, y, z);
+    verticalVelocity = 0;
+    snapToGround();
+    updateFollowCamera();
+    return player.position.toArray();
+  },
+  setTraffic: enabled => { if (traffic) traffic.enabled = enabled; },
+  setCrowd: enabled => { if (crowd) crowd.enabled = enabled; },
+  attackNearestPed,
+  // Forces a locomotion clip, for tests that need a known stride.
+  play: name => { setClip(name, { fade: 0.05 }); return animState; },
+  // Freeze or resume the simulation. Rendering continues either way, so a
+  // paused world can be looked at from anywhere.
+  setPaused: value => { paused = !!value; return paused; },
+  isPaused: () => paused,
+  // Point the camera at a spot regardless of mode. Only useful while paused,
+  // since the walk controller owns the camera otherwise.
+  lookAtPoint: (x, y, z, from = [3, 2, 3]) => {
+    camera.position.set(x + from[0], y + from[1], z + from[2]);
+    camera.lookAt(new THREE.Vector3(x, y, z));
+    return camera.position.toArray();
+  },
+  reportCrime: (crime, options) => { const stars = wanted.report(crime, options); refreshStars(); return stars; },
+  clearWanted: () => { wanted.clear(); police?.clear(); refreshStars(); },
   // What the character is currently colliding against, for debugging from the
   // console or a test.
   collisionMeshes: () => nearMeshes,
@@ -731,6 +1064,12 @@ globalThis.gta4map = {
       desaturation: [lighting.frame.desaturation, lighting.frame.desaturationFar],
       depthFx: [lighting.frame.depthFxNear, lighting.frame.depthFxFar],
     },
+    traffic: traffic ? traffic.getState() : null,
+    crowd: crowd ? crowd.getState() : null,
+    wanted: wanted.getState(),
+    police: police ? police.getState() : null,
+    driving: driving.getState(),
+    weapons: weapons ? weapons.getState() : null,
     loadedSectors: [...loaded.keys()],
     // Sectors whose GLB has arrived but whose batches are still being built.
     pendingSectors: [...loaded.values()].filter(record => !record.ready).map(record => record.sector.id),
@@ -763,10 +1102,20 @@ function frame() {
   requestAnimationFrame(frame);
   timer.update();
   const dt = Math.min(timer.getDelta(), 0.05);
-  movePlayer(dt);
+  if (!paused) {
+    movePlayer(dt);
+    // Traffic populates the area the player occupies in walk mode and the area
+    // being looked at otherwise, so it is present in fly-through as well.
+    const populationCentre = mode === 'walk' ? player.position : camera.position;
+    traffic?.update(dt, populationCentre);
+    crowd?.update(dt, populationCentre);
+    police?.update(dt, populationCentre);
+    if (mode === 'drive') runOverPeds();
+    weapons?.update(dt);
+    streamTimer -= dt;
+    if (streamTimer <= 0) { streamTimer = 1.2; streamSectors(); }
+  }
   lighting.follow();
-  streamTimer -= dt;
-  if (streamTimer <= 0) { streamTimer = 1.2; streamSectors(); }
   // A handful of uniform writes, so it is cheaper than tracking when the
   // keyframe or the toggle last changed.
   grading.update(lighting.frame, lighting.exposure);

@@ -15,6 +15,7 @@ artifacts/
 # path, so worktrees junction this directory rather than copying it.
 converter/
 
-# Generated from pc/data/timecyc.dat by `npm run extract:timecyc`. Rockstar
-# data, so it stays local like web/assets.
+# Derived from the installed game by the extract:* scripts — the timecycle, the
+# road graph and the ped navmesh. Rockstar data, so it stays local like
+# web/assets.
 web/data/

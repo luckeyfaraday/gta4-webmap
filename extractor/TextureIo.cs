@@ -52,22 +52,46 @@ static class TextureIo
         return result.Length == 0 ? "texture" : result;
     }
 
-    public static void WriteDds(string path, Texture texture)
+    // How many leading mips to drop so the top level fits inside maxEdge.
+    // Trimming is a slice of the chain the game already stored, so it costs no
+    // re-encode and no quality beyond the resolution deliberately given up.
+    // Never trims away the last level.
+    public static int LevelsToSkip(Texture texture, int maxEdge)
     {
+        if (maxEdge <= 0 || texture == null) return 0;
+        var skip = 0;
+        while (skip < texture.Levels - 1 &&
+               (Math.Max(1u, texture.Width >> skip) > maxEdge || Math.Max(1u, texture.Height >> skip) > maxEdge))
+            skip++;
+        return skip;
+    }
+
+    public static void WriteDds(string path, Texture texture, int skipLevels = 0)
+    {
+        skipLevels = Math.Clamp(skipLevels, 0, Math.Max(0, texture.Levels - 1));
+        var width = Math.Max(1u, texture.Width >> skipLevels);
+        var height = Math.Max(1u, texture.Height >> skipLevels);
+        var levels = Math.Max(1, texture.Levels - skipLevels);
+
         using var stream = System.IO.File.Create(path);
         using var output = new BinaryWriter(stream);
         output.Write(0x20534444u); output.Write(124u);
-        var mipmapped = texture.Levels > 1;
+        var mipmapped = levels > 1;
         output.Write(mipmapped ? 0x000A1007u : 0x00081007u);
-        output.Write(texture.Height); output.Write(texture.Width); output.Write(texture.GetDataSize(0));
-        output.Write(0u); output.Write((uint)Math.Max(1, texture.Levels));
+        output.Write(height); output.Write(width); output.Write(texture.GetDataSize(skipLevels));
+        output.Write(0u); output.Write((uint)levels);
         for (var i = 0; i < 11; i++) output.Write(0u);
         output.Write(32u); output.Write(0x4u);
         output.Write(texture.Format switch { D3DFormat.DXT1 => 0x31545844u, D3DFormat.DXT3 => 0x33545844u, D3DFormat.DXT5 => 0x35545844u, _ => 0u });
         for (var i = 0; i < 5; i++) output.Write(0u);
         output.Write(mipmapped ? 0x00401008u : 0x1000u);
         for (var i = 0; i < 4; i++) output.Write(0u);
-        output.Write(texture.GetAllMipData());
+
+        var all = texture.GetAllMipData();
+        var offset = 0;
+        for (var level = 0; level < skipLevels; level++) offset += checked((int)texture.GetDataSize(level));
+        offset = Math.Min(offset, all.Length);
+        output.Write(all, offset, all.Length - offset);
     }
 
     public static void WritePng(string path, Texture texture)
@@ -139,7 +163,18 @@ static class TextureIo
 
     // Writes one RAGE texture next to the others and returns its relative URI,
     // or null when the format is not something a browser can decode.
-    public static string Export(Texture texture, string outputDir, string uriPrefix)
+    //
+    // maxEdge caps the top mip level. It only applies to block-compressed
+    // textures, whose stored chain can simply be sliced; an uncompressed one is
+    // written whole. Callers that cap must write to their own directory, since
+    // the name does not record the cap and a trimmed file must never be mistaken
+    // for the full-resolution one in the shared cache.
+    // namePrefix namespaces the written file. It exists because ped textures
+    // are NOT uniquely named: every ped's own .wtd calls its shirt
+    // "uppr_diff_000_a_uni", and those are different images. Deduplicating them
+    // by name would silently dress the whole population in the first ped's
+    // clothes. Callers with globally unique texture names leave it empty.
+    public static string Export(Texture texture, string outputDir, string uriPrefix, int maxEdge = 0, string namePrefix = "")
     {
         if (texture == null) return null;
         if (texture.Format is not (D3DFormat.DXT1 or D3DFormat.DXT3 or D3DFormat.DXT5 or D3DFormat.A8R8G8B8 or D3DFormat.L8))
@@ -148,11 +183,12 @@ static class TextureIo
             return null;
         }
         var compressed = texture.Format is D3DFormat.DXT1 or D3DFormat.DXT3 or D3DFormat.DXT5;
-        var safeName = SafeName(texture.Name) + (compressed ? ".dds" : ".png");
+        var safeName = (string.IsNullOrEmpty(namePrefix) ? "" : SafeName(namePrefix) + "__")
+            + SafeName(texture.Name) + (compressed ? ".dds" : ".png");
         var target = Path.Combine(outputDir, safeName);
         if (!System.IO.File.Exists(target))
         {
-            if (compressed) WriteDds(target, texture);
+            if (compressed) WriteDds(target, texture, LevelsToSkip(texture, maxEdge));
             else WritePng(target, texture);
         }
         return uriPrefix + safeName;

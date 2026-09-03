@@ -10,6 +10,7 @@ using RageLib.FileSystem;
 using RageLib.Models.Resource;
 using RageLib.Models.Resource.Models;
 using RageLib.Textures;
+using static RageGltf;
 using ArchiveFile = RageLib.FileSystem.Common.File;
 using DrawableResource = RageLib.Models.Resource.File<RageLib.Models.Resource.DrawableModel>;
 using ResourceSkeleton = RageLib.Models.Resource.Skeletons.Skeleton;
@@ -33,6 +34,21 @@ static class PlayerExport
     // jump_std holds the takeoff/in-air/landing chain.
     private static readonly string[] AnimationWads = { "move_player.wad", "jump_std.wad" };
 
+    // Armed animation, written to its own clip library beside the character so
+    // player.gltf stays the size it is. Every gun@ set names its clips the same
+    // - fire, reload, holster, unholster - so they are namespaced by set, the
+    // same lesson the ped library taught. move_rifle and move_rpg are the armed
+    // walk cycles; the pistol keeps the ordinary one, as it does in game.
+    private static readonly (string Wad, string Set)[] WeaponWads =
+    {
+        ("gun@handgun.wad", "handgun"),
+        ("gun@rifle.wad", "rifle"),
+        ("gun@rocket.wad", "rocket"),
+        ("gun@aim_idles.wad", "aim"),
+        ("move_rifle.wad", "move_rifle"),
+        ("move_rpg.wad", "move_rpg"),
+    };
+
     // No clip drives the arm roll bones — GTA IV solves them at runtime, and
     // leaving them at the bind pose shears the skin around the elbow and
     // shoulder as the arm turns. Each roll bone takes a share of the twist its
@@ -47,42 +63,7 @@ static class PlayerExport
         (14752, 1224, 1, 0, 0),  // R_UpperArmRoll     <- Char_R_UpperArm
     };
 
-    // RAGE is Z-up right-handed, glTF is Y-up right-handed. This is the proper
-    // (determinant +1) conversion, so bone rotations convert as real
-    // quaternions and triangle winding is preserved. Program.cs maps the world
-    // with (-x, z, -y) instead, which is a reflection; app.js mirrors the
-    // character back into that space with a single scale.x = -1.
-    private static (float X, float Y, float Z) ToGltf(float x, float y, float z) => (x, z, -y);
 
-    private static Quat ToGltf(Quat q) => new Quat(q.X, q.Z, -q.Y, q.W);
-
-    public struct Quat
-    {
-        public float X, Y, Z, W;
-        public Quat(float x, float y, float z, float w) { X = x; Y = y; Z = z; W = w; }
-        public static Quat Identity => new Quat(0, 0, 0, 1);
-        public Quat Conjugate() => new Quat(-X, -Y, -Z, W);
-
-        public static Quat Multiply(Quat a, Quat b) => new Quat(
-            a.W * b.X + a.X * b.W + a.Y * b.Z - a.Z * b.Y,
-            a.W * b.Y - a.X * b.Z + a.Y * b.W + a.Z * b.X,
-            a.W * b.Z + a.X * b.Y - a.Y * b.X + a.Z * b.W,
-            a.W * b.W - a.X * b.X - a.Y * b.Y - a.Z * b.Z);
-
-        public (float X, float Y, float Z) Rotate(float x, float y, float z)
-        {
-            var tx = 2 * (Y * z - Z * y);
-            var ty = 2 * (Z * x - X * z);
-            var tz = 2 * (X * y - Y * x);
-            return (x + W * tx + (Y * tz - Z * ty), y + W * ty + (Z * tx - X * tz), z + W * tz + (X * ty - Y * tx));
-        }
-
-        public Quat Normalized()
-        {
-            var length = MathF.Sqrt(X * X + Y * Y + Z * Z + W * W);
-            return length > 0 ? new Quat(X / length, Y / length, Z / length, W / length) : Identity;
-        }
-    }
 
     // Bone 0 ("Char") lists itself as its own parent; every other entry is a
     // real index into the bone array.
@@ -256,7 +237,7 @@ static class PlayerExport
             if (StoredRotationIsConjugated(skeleton, out var asStored, out _))
                 throw new InvalidDataException($"Unexpected bone rotation handedness (chain error {asStored:F4}m); the export would be scrambled.");
 
-            var writer = new PlayerGltfWriter();
+            var writer = new ModelGltfWriter("gta4-webmap-player");
             var boneCount = skeleton.Bones.Count;
 
             // Bone nodes, in glTF space. The bind pose is composed here rather
@@ -343,7 +324,7 @@ static class PlayerExport
                         if (textureUri == null)
                             Console.Error.WriteLine($"  {component}: no texture for shader '{shaderName}' (wanted '{textureName}')");
                         var material = writer.AddMaterial($"{component}_{geometryIndex}", shaderName, textureName, textureUri, component.StartsWith("hair"));
-                        primitives.Add(BuildPrimitive(writer, geometry, material, skeleton, boneNodes, ref lowestY, ref vertexTotal));
+                        primitives.Add(BuildSkinnedPrimitive(writer, geometry, material, boneNodes, ref lowestY, ref vertexTotal));
                     }
                 }
                 drawable.Dispose();
@@ -393,6 +374,59 @@ static class PlayerExport
                     }
                     Console.WriteLine($"  {wadName}: {added} clip(s)");
                 }
+
+                // The armed set, into its own file against the same skeleton, so
+                // the viewer fetches it only when a weapon is drawn.
+                var weaponWriter = new ModelGltfWriter("gta4-webmap-weapon-clips");
+                var weaponBones = new int[boneCount];
+                var weaponChildren = new List<int>[boneCount];
+                var weaponIdToNode = new Dictionary<int, int>();
+                for (var i = 0; i < boneCount; i++) weaponChildren[i] = new List<int>();
+                for (var i = 0; i < boneCount; i++)
+                {
+                    var bone = skeleton.Bones[i];
+                    var localPosition = ToGltf(bone.Position.X, bone.Position.Y, bone.Position.Z);
+                    var localRotation = ToGltf(new Quat(bone.RotationQuaternion.X, bone.RotationQuaternion.Y, bone.RotationQuaternion.Z, bone.RotationQuaternion.W).Normalized());
+                    weaponBones[i] = weaponWriter.AddNode(new Dictionary<string, object>
+                    {
+                        ["name"] = string.IsNullOrEmpty(bone.Name) ? $"bone_{i}" : bone.Name,
+                        ["translation"] = new[] { localPosition.X, localPosition.Y, localPosition.Z },
+                        ["rotation"] = new[] { localRotation.X, localRotation.Y, localRotation.Z, localRotation.W },
+                    });
+                    var weaponParent = ParentOf(skeleton, i);
+                    if (weaponParent >= 0) weaponChildren[weaponParent].Add(weaponBones[i]);
+                    weaponIdToNode.TryAdd(bone.BoneID, weaponBones[i]);
+                }
+                for (var i = 0; i < boneCount; i++)
+                    if (weaponChildren[i].Count > 0) weaponWriter.SetNodeChildren(weaponBones[i], weaponChildren[i]);
+
+                var weaponClips = new List<Dictionary<string, object>>();
+                foreach (var weapon in WeaponWads)
+                {
+                    if (!entries.TryGetValue(weapon.Wad, out var weaponWad)) { Console.Error.WriteLine($"  missing {weapon.Wad}"); continue; }
+                    using var weaponDictionary = new AnimationDictionaryFile();
+                    weaponDictionary.Open(new MemoryStream(weaponWad.GetData(), writable: false));
+                    var weaponAdded = 0;
+                    foreach (var clip in weaponDictionary.File.Data.Entries)
+                    {
+                        var info = AddAnimation(weaponWriter, clip, weaponIdToNode, weaponBones[0], rootRest, restByBoneId, weapon.Set + "/");
+                        if (info == null) continue;
+                        info["set"] = weapon.Set;
+                        info["wad"] = Path.GetFileNameWithoutExtension(weapon.Wad);
+                        weaponClips.Add(info);
+                        weaponAdded++;
+                    }
+                    Console.WriteLine($"  {weapon.Wad}: {weaponAdded} clip(s) -> {weapon.Set}/");
+                }
+                var weaponRoot = weaponWriter.AddNode(new Dictionary<string, object>
+                {
+                    ["name"] = "player_rig",
+                    ["children"] = new[] { weaponBones[0] },
+                });
+                weaponWriter.Write(outputDir, "weaponclips.gltf", "weaponclips.bin",
+                    new Dictionary<string, object> { ["bones"] = boneCount, ["clips"] = weaponClips },
+                    sceneRoot: weaponRoot, manifestName: null);
+                Console.WriteLine($"  weapon clip library: {weaponClips.Count} clip(s)");
             }
             finally { animationImg.Close(); }
 
@@ -432,8 +466,11 @@ static class PlayerExport
         return parsed;
     }
 
-    private static Dictionary<string, object> BuildPrimitive(PlayerGltfWriter writer, Geometry geometry, int material,
-        ResourceSkeleton skeleton, int[] boneNodes, ref float lowestY, ref int vertexTotal)
+    // internal, and skeleton-free: PedExport builds the identical primitive for
+    // the ambient peds, which share this vertex layout and matrix-palette
+    // indirection. (The skeleton parameter this used to take was never read.)
+    internal static Dictionary<string, object> BuildSkinnedPrimitive(ModelGltfWriter writer, Geometry geometry, int material,
+        int[] boneNodes, ref float lowestY, ref int vertexTotal)
     {
         var declaration = geometry.VertexBuffer.VertexDeclaration.DecodeAsVertexElements();
         var offsets = new Dictionary<(VertexElementUsage, int), int>();
@@ -518,9 +555,17 @@ static class PlayerExport
     // travel from its move-blend data — it is a ±0.1m body sway, applied here
     // the same way PedAnimationSystem applies it: x/y absolute over the rest
     // position, z relative to the clip's first frame.
-    private static Dictionary<string, object> AddAnimation(PlayerGltfWriter writer, AnimationData clip,
+    // internal so PedExport can share it: the ambient peds use the same clip
+    // format and the same BoneID-keyed tracks, on a skeleton that differs from
+    // Niko's only in size.
+    // namePrefix namespaces the clip. Niko's two wads have no name in common so
+    // he passes none, but the ped library merges three: move_m@generic,
+    // move_f@generic and move_cop share 50 names between them — "walk", "run"
+    // and "idle" among them — and without a prefix the female and police sets
+    // are silently shadowed by whichever loaded first.
+    internal static Dictionary<string, object> AddAnimation(ModelGltfWriter writer, AnimationData clip,
         Dictionary<int, int> boneIdToNode, int rootNode, (float X, float Y, float Z) rootRest,
-        Dictionary<int, Quat> restByBoneId)
+        Dictionary<int, Quat> restByBoneId, string namePrefix = "")
     {
         if (clip?.Tracks == null || clip.NumFrames < 2 || clip.Duration <= 0) return null;
         var frames = clip.NumFrames;
@@ -665,7 +710,7 @@ static class PlayerExport
         }
 
         if (channels.Count == 0) return null;
-        var name = CleanClipName(clip.Name);
+        var name = namePrefix + CleanClipName(clip.Name);
         writer.AddAnimation(name, channels, samplers);
         return new Dictionary<string, object>
         {
@@ -720,152 +765,4 @@ static class PlayerExport
 
     private static float ReadFloat(byte[] data, int offset) =>
         BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(offset, 4)));
-
-    // A small glTF writer for one skinned, animated character. The map writer in
-    // Program.cs emits a flat instanced scene and shares no structure with this.
-    private sealed class PlayerGltfWriter
-    {
-        private readonly MemoryStream binary = new();
-        private readonly List<object> bufferViews = new(), accessors = new(), meshes = new(), materials = new(), skins = new(), animations = new();
-        private readonly List<Dictionary<string, object>> nodes = new();
-
-        public int AddNode(Dictionary<string, object> node) { nodes.Add(node); return nodes.Count - 1; }
-
-        public void SetNodeChildren(int node, List<int> children) => nodes[node]["children"] = children.ToArray();
-
-        public int AddMaterial(string name, string shader, string textureName, string textureUri, bool cutout)
-        {
-            materials.Add(new Dictionary<string, object>
-            {
-                ["name"] = name,
-                ["pbrMetallicRoughness"] = new Dictionary<string, object>
-                {
-                    ["baseColorFactor"] = new[] { 1f, 1f, 1f, 1f },
-                    ["metallicFactor"] = 0f,
-                    ["roughnessFactor"] = .78f,
-                },
-                ["doubleSided"] = cutout,
-                ["alphaMode"] = cutout ? "MASK" : "OPAQUE",
-                ["alphaCutoff"] = .4f,
-                ["extras"] = new Dictionary<string, object> { ["shader"] = shader, ["textureName"] = textureName, ["texture"] = textureUri },
-            });
-            return materials.Count - 1;
-        }
-
-        public int AddMesh(string name, List<Dictionary<string, object>> primitives)
-        {
-            meshes.Add(new Dictionary<string, object> { ["name"] = name, ["primitives"] = primitives.ToArray() });
-            return meshes.Count - 1;
-        }
-
-        public int AddSkin(int[] joints, int inverseBindMatrices, int skeletonRoot)
-        {
-            skins.Add(new Dictionary<string, object>
-            {
-                ["joints"] = joints,
-                ["inverseBindMatrices"] = inverseBindMatrices,
-                ["skeleton"] = skeletonRoot,
-            });
-            return skins.Count - 1;
-        }
-
-        public void AddAnimation(string name, List<Dictionary<string, object>> channels, List<Dictionary<string, object>> samplers) =>
-            animations.Add(new Dictionary<string, object> { ["name"] = name, ["channels"] = channels.ToArray(), ["samplers"] = samplers.ToArray() });
-
-        // vertexData tags the buffer view as ARRAY_BUFFER. Animation samplers
-        // and inverse-bind matrices are not vertex attributes, and glTF forbids
-        // a target on those views.
-        public int AddFloatAccessor(float[] values, int components, bool minMax, bool vertexData = true)
-        {
-            Align();
-            var offset = binary.Position;
-            using (var output = new BinaryWriter(binary, System.Text.Encoding.UTF8, true))
-                foreach (var value in values) output.Write(value);
-            var view = AddView(offset, values.Length * 4, vertexData ? 34962 : (int?)null);
-            var count = values.Length / components;
-            var accessor = new Dictionary<string, object>
-            {
-                ["bufferView"] = view,
-                ["componentType"] = 5126,
-                ["count"] = count,
-                ["type"] = components switch { 1 => "SCALAR", 2 => "VEC2", 3 => "VEC3", 4 => "VEC4", 16 => "MAT4", _ => throw new ArgumentOutOfRangeException(nameof(components)) },
-            };
-            if (minMax)
-            {
-                accessor["min"] = Enumerable.Range(0, components).Select(c => Enumerable.Range(0, count).Min(i => values[i * components + c])).ToArray();
-                accessor["max"] = Enumerable.Range(0, components).Select(c => Enumerable.Range(0, count).Max(i => values[i * components + c])).ToArray();
-            }
-            accessors.Add(accessor);
-            return accessors.Count - 1;
-        }
-
-        public int AddByteAccessor(byte[] values, bool normalized)
-        {
-            Align();
-            var offset = binary.Position;
-            binary.Write(values, 0, values.Length);
-            var view = AddView(offset, values.Length, 34962);
-            var accessor = new Dictionary<string, object>
-            {
-                ["bufferView"] = view,
-                ["componentType"] = 5121,
-                ["count"] = values.Length / 4,
-                ["type"] = "VEC4",
-            };
-            if (normalized) accessor["normalized"] = true;
-            accessors.Add(accessor);
-            return accessors.Count - 1;
-        }
-
-        public int AddIndexAccessor(uint[] values)
-        {
-            Align();
-            var offset = binary.Position;
-            using (var output = new BinaryWriter(binary, System.Text.Encoding.UTF8, true))
-                foreach (var value in values) output.Write(value);
-            var view = AddView(offset, values.Length * 4, 34963);
-            accessors.Add(new Dictionary<string, object>
-            {
-                ["bufferView"] = view,
-                ["componentType"] = 5125,
-                ["count"] = values.Length,
-                ["type"] = "SCALAR",
-            });
-            return accessors.Count - 1;
-        }
-
-        public void Write(string outputDir, string gltfName, string binName, Dictionary<string, object> extras)
-        {
-            System.IO.File.WriteAllBytes(Path.Combine(outputDir, binName), binary.ToArray());
-            var root = new Dictionary<string, object>
-            {
-                ["asset"] = new Dictionary<string, object> { ["version"] = "2.0", ["generator"] = "gta4-webmap-player" },
-                ["scene"] = 0,
-                ["scenes"] = new[] { new Dictionary<string, object> { ["nodes"] = new[] { nodes.Count - 1 } } },
-                ["nodes"] = nodes,
-                ["meshes"] = meshes,
-                ["materials"] = materials,
-                ["skins"] = skins,
-                ["accessors"] = accessors,
-                ["bufferViews"] = bufferViews,
-                ["buffers"] = new[] { new Dictionary<string, object> { ["uri"] = binName, ["byteLength"] = binary.Length } },
-                ["extras"] = extras,
-            };
-            if (animations.Count > 0) root["animations"] = animations;
-            System.IO.File.WriteAllText(Path.Combine(outputDir, gltfName), JsonSerializer.Serialize(root));
-            System.IO.File.WriteAllText(Path.Combine(outputDir, "manifest.json"), JsonSerializer.Serialize(extras, new JsonSerializerOptions { WriteIndented = true }));
-        }
-
-        private int AddView(long offset, int length, int? target)
-        {
-            var view = new Dictionary<string, object> { ["buffer"] = 0, ["byteOffset"] = offset, ["byteLength"] = length };
-            // Animation and inverse-bind data is not vertex data, and glTF
-            // forbids tagging those buffer views with an array target.
-            if (target.HasValue) view["target"] = target.Value;
-            bufferViews.Add(view);
-            return bufferViews.Count - 1;
-        }
-
-        private void Align() { while ((binary.Position & 3) != 0) binary.WriteByte(0); }
-    }
 }

@@ -10,6 +10,12 @@
   <ItemGroup>
     <Compile Include="Program.cs" />
     <Compile Include="PlayerExport.cs" />
+    <Compile Include="ModelGltfWriter.cs" />
+    <Compile Include="VehicleExport.cs" />
+    <Compile Include="VehicleData.cs" />
+    <Compile Include="PedExport.cs" />
+    <Compile Include="NavmeshExport.cs" />
+    <Compile Include="WeaponExport.cs" />
     <Compile Include="TextureIo.cs" />
     <Compile Include="HeadlessTextures.cs" />
     <Compile Include="UnityStubs.cs" />

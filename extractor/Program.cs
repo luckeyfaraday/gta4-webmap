@@ -29,6 +29,152 @@ if (args.Length >= 3 && args[0].Equals("--extract-player", StringComparison.Ordi
     return PlayerExport.Run(playerGame, playerOutput, playerTextureDir, playerTexturePrefix);
 }
 
+if (args.Length >= 3 && args[0].Equals("--extract-weapons", StringComparison.OrdinalIgnoreCase))
+{
+    // --extract-weapons <gameDir> <outputDir> [textureDir] [textureUriPrefix]
+    var weaponGame = Path.GetFullPath(args[1]);
+    var weaponOutput = Path.GetFullPath(args[2]);
+    var weaponKey = new KeyUtilGTAIV().FindKey(weaponGame);
+    if (weaponKey == null) throw new InvalidOperationException("Could not locate GTA IV archive key in GTAIV.exe");
+    KeyStore.SetKeyLoader(() => weaponKey);
+    var weaponTextureDir = args.Length >= 4 ? Path.GetFullPath(args[3]) : Path.Combine(weaponOutput, "textures");
+    var weaponTexturePrefix = args.Length >= 5 ? args[4].TrimEnd('/') + "/" : "textures/";
+    return WeaponExport.Run(weaponGame, weaponOutput, weaponTextureDir, weaponTexturePrefix);
+}
+
+if (args.Length >= 3 && args[0].Equals("--extract-peds", StringComparison.OrdinalIgnoreCase))
+{
+    // --extract-peds <gameDir> <outputDir> [textureDir] [textureUriPrefix] [maxEdge] [ped...]
+    var pedGame = Path.GetFullPath(args[1]);
+    var pedOutput = Path.GetFullPath(args[2]);
+    var pedKey = new KeyUtilGTAIV().FindKey(pedGame);
+    if (pedKey == null) throw new InvalidOperationException("Could not locate GTA IV archive key in GTAIV.exe");
+    KeyStore.SetKeyLoader(() => pedKey);
+    var pedTextureDir = args.Length >= 4 ? Path.GetFullPath(args[3]) : Path.Combine(pedOutput, "textures");
+    var pedTexturePrefix = args.Length >= 5 ? args[4].TrimEnd('/') + "/" : "textures/";
+    var pedMaxEdge = args.Length >= 6 && int.TryParse(args[5], out var edge) ? edge : 256;
+    return PedExport.Run(pedGame, pedOutput, pedTextureDir, pedTexturePrefix, pedMaxEdge, args.Skip(6).ToArray());
+}
+
+if (args.Length >= 3 && args[0].Equals("--extract-navmesh", StringComparison.OrdinalIgnoreCase))
+{
+    // --extract-navmesh <gameDir> <outputJson> [gridCellMetres]
+    var navGame = Path.GetFullPath(args[1]);
+    var navOutput = Path.GetFullPath(args[2]);
+    var navKey = new KeyUtilGTAIV().FindKey(navGame);
+    if (navKey == null) throw new InvalidOperationException("Could not locate GTA IV archive key in GTAIV.exe");
+    KeyStore.SetKeyLoader(() => navKey);
+    var navCell = args.Length >= 4 && float.TryParse(args[3], System.Globalization.NumberStyles.Float,
+        System.Globalization.CultureInfo.InvariantCulture, out var parsed) ? parsed : 2.5f;
+    return NavmeshExport.Run(navGame, navOutput, navCell);
+}
+
+if (args.Length >= 3 && args[0].Equals("--list-clips", StringComparison.OrdinalIgnoreCase))
+{
+    // Diagnostic: the clip names inside one or more .wad animation dictionaries.
+    var clipGame = Path.GetFullPath(args[1]);
+    var clipKey = new KeyUtilGTAIV().FindKey(clipGame);
+    if (clipKey == null) throw new InvalidOperationException("Could not locate GTA IV archive key in GTAIV.exe");
+    KeyStore.SetKeyLoader(() => clipKey);
+    var clipImg = new IMGFileSystem();
+    clipImg.Open(Path.Combine(clipGame, "pc", "anim", "anim.img"));
+    try
+    {
+        var entries = clipImg.GetAllFiles().ToDictionary(file => file.Name, StringComparer.OrdinalIgnoreCase);
+        foreach (var wanted in args.Skip(2))
+        {
+            var name = wanted.EndsWith(".wad", StringComparison.OrdinalIgnoreCase) ? wanted : wanted + ".wad";
+            if (!entries.TryGetValue(name, out var wad)) { Console.Error.WriteLine($"{name}: not found"); continue; }
+            using var dictionary = new RageLib.Animation.AnimationDictionaryFile();
+            dictionary.Open(new MemoryStream(wad.GetData(), writable: false));
+            var clips = dictionary.File.Data.Entries;
+            Console.WriteLine($"=== {name}: {clips.Count} clip(s) ===");
+            foreach (var clip in clips)
+                Console.WriteLine($"  {clip.Name,-42} {clip.NumFrames,4} frames  {clip.Duration:0.00}s");
+        }
+    }
+    finally { clipImg.Close(); }
+    return 0;
+}
+
+if (args.Length >= 3 && args[0].Equals("--probe-ped", StringComparison.OrdinalIgnoreCase))
+{
+    var probePedGame = Path.GetFullPath(args[1]);
+    var probePedKey = new KeyUtilGTAIV().FindKey(probePedGame);
+    if (probePedKey == null) throw new InvalidOperationException("Could not locate GTA IV archive key in GTAIV.exe");
+    KeyStore.SetKeyLoader(() => probePedKey);
+    return PedExport.Probe(probePedGame, args.Skip(2).ToArray());
+}
+
+if (args.Length >= 3 && args[0].Equals("--extract-vehicles", StringComparison.OrdinalIgnoreCase))
+{
+    // --extract-vehicles <gameDir> <outputDir> [textureDir] [textureUriPrefix] [model...]
+    var vehicleGame = Path.GetFullPath(args[1]);
+    var vehicleOutput = Path.GetFullPath(args[2]);
+    var vehicleKey = new KeyUtilGTAIV().FindKey(vehicleGame);
+    if (vehicleKey == null) throw new InvalidOperationException("Could not locate GTA IV archive key in GTAIV.exe");
+    KeyStore.SetKeyLoader(() => vehicleKey);
+    var vehicleTextureDir = args.Length >= 4 ? Path.GetFullPath(args[3]) : Path.Combine(vehicleOutput, "textures");
+    var vehicleTexturePrefix = args.Length >= 5 ? args[4].TrimEnd('/') + "/" : "textures/";
+    return VehicleExport.Run(vehicleGame, vehicleOutput, vehicleTextureDir, vehicleTexturePrefix, args.Skip(5).ToArray());
+}
+
+if (args.Length >= 3 && args[0].Equals("--probe-vehicle", StringComparison.OrdinalIgnoreCase))
+{
+    var probeVehicleGame = Path.GetFullPath(args[1]);
+    var probeVehicleKey = new KeyUtilGTAIV().FindKey(probeVehicleGame);
+    if (probeVehicleKey == null) throw new InvalidOperationException("Could not locate GTA IV archive key in GTAIV.exe");
+    KeyStore.SetKeyLoader(() => probeVehicleKey);
+    return VehicleExport.Probe(probeVehicleGame, args.Skip(2).ToArray());
+}
+
+if (args.Length >= 5 && args[0].Equals("--dump-file", StringComparison.OrdinalIgnoreCase))
+{
+    // Diagnostic: pull one entry out of an archive to disk, so a format with no
+    // RageLib reader can be examined directly.
+    var dumpGame = Path.GetFullPath(args[1]);
+    var dumpArchive = Path.Combine(dumpGame, args[2].Replace('/', Path.DirectorySeparatorChar));
+    var dumpKey = new KeyUtilGTAIV().FindKey(dumpGame);
+    if (dumpKey == null) throw new InvalidOperationException("Could not locate GTA IV archive key in GTAIV.exe");
+    KeyStore.SetKeyLoader(() => dumpKey);
+    RageLib.FileSystem.Common.FileSystem dumpFs = dumpArchive.EndsWith(".rpf", StringComparison.OrdinalIgnoreCase)
+        ? new RPFFileSystem()
+        : new IMGFileSystem();
+    dumpFs.Open(dumpArchive);
+    try
+    {
+        var wanted = dumpFs.GetAllFiles().FirstOrDefault(file => file.Name.Equals(args[3], StringComparison.OrdinalIgnoreCase));
+        if (wanted == null) { Console.Error.WriteLine($"{args[3]} not found in {args[2]}"); return 1; }
+        var bytes = wanted.GetData();
+        System.IO.File.WriteAllBytes(Path.GetFullPath(args[4]), bytes);
+        Console.WriteLine($"{wanted.Name}: {bytes.Length} bytes -> {args[4]}");
+    }
+    finally { dumpFs.Close(); }
+    return 0;
+}
+
+if (args.Length >= 3 && args[0].Equals("--list-archive", StringComparison.OrdinalIgnoreCase))
+{
+    // Diagnostic: names, extensions and sizes inside one .img/.rpf, so a new
+    // export can be planned against what the archive actually holds.
+    var listGame = Path.GetFullPath(args[1]);
+    var listPath = Path.Combine(listGame, args[2].Replace('/', Path.DirectorySeparatorChar));
+    var listKey = new KeyUtilGTAIV().FindKey(listGame);
+    if (listKey == null) throw new InvalidOperationException("Could not locate GTA IV archive key in GTAIV.exe");
+    KeyStore.SetKeyLoader(() => listKey);
+    RageLib.FileSystem.Common.FileSystem listFs = listPath.EndsWith(".rpf", StringComparison.OrdinalIgnoreCase)
+        ? new RPFFileSystem()
+        : new IMGFileSystem();
+    listFs.Open(listPath);
+    try
+    {
+        foreach (var entry in listFs.GetAllFiles().OrderBy(file => file.Name, StringComparer.OrdinalIgnoreCase))
+            Console.WriteLine($"{entry.Name}	{entry.Size}");
+    }
+    finally { listFs.Close(); }
+    return 0;
+}
+
 if (args.Length >= 2 && args[0].Equals("--probe-player", StringComparison.OrdinalIgnoreCase))
 {
     var probePlayerGame = Path.GetFullPath(args[1]);

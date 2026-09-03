@@ -4,8 +4,16 @@ This project reads the installed GTA IV archives locally and exports the complet
 outdoor Liberty City map — 34 sectors across Manhattan, Broker/Dukes/Bohan and
 Alderney — to a streaming Three.js viewer with Overview, Fly and Walk modes.
 Walk mode plays as Niko in third person, with his own skeleton, textures and
-animations. Rockstar assets remain local and are not included in the source
-code.
+animations. The city's cast is exported too: all 127 traffic vehicles, and 343
+ambient peds driven by one shared library of 112 locomotion clips. Rockstar
+assets remain local and are not included in the source code.
+
+| | models | payload |
+| --- | --- | --- |
+| map | 34 sectors | see Rendering |
+| player | 1, 62 clips | 2.8 MB |
+| vehicles | 127 | 19 MB |
+| peds | 343, 112 shared clips | 30 MB + 51 MB textures |
 
 ## Run
 
@@ -24,6 +32,11 @@ npm run extract:world   # all 34 outdoor sectors + web/assets/world.json + textu
 npm run extract         # single proof sector (manhat01) only
 npm run pack            # texture bundles only (--max-edge 256, --sector <id>, --force)
 npm run extract:player  # Niko + his animation clips -> web/assets/player/
+npm run extract:vehicles # all 127 traffic vehicles -> web/assets/vehicles/
+npm run extract:peds    # all 343 ambient peds + shared clips -> web/assets/peds/
+npm run extract:weapons # pistol, M4 and RPG + their stats -> web/assets/weapons/
+npm run extract:paths   # the road network -> web/data/paths.json
+npm run extract:navmesh # the ped navmesh -> web/data/navmesh.json + .bin
 ```
 
 The extractor reads each sector's `.img`, its base/streaming WPL placements,
@@ -161,6 +174,458 @@ The map is exported through `(-x, z, -y)`, which is a reflection, so the world
 is mirrored; the character uses the proper `(x, z, -y)` conversion and is
 mirrored back to match with a single `scale.x = -1`.
 
+## Vehicles
+
+`npm run extract:vehicles` reads `pc/models/cdimages/vehicles.img` and writes
+one Meshopt-compressed `.glb` per model into `web/assets/vehicles/`, plus a
+`vehicles.json` catalogue, sharing the same deduplicated texture cache as the
+map. All 127 models in `vehicles.ide` export, none skipped.
+
+The thing worth knowing about a `.wft`: a car looks like it should be a bag of
+loose parts, and it is not. The fragment's `Children` are physics proxies and
+all but one report no geometry at all — the whole body is a *single* drawable,
+rigid-skinned to the 40-70 bone fragment skeleton, with a per-geometry matrix
+palette binding each panel to its bone. Doors, sirens, lights and glass separate
+by joint, not by mesh. So a car exports through the same path the player does,
+minus the clips, and the viewer opens a door by rotating `door_dside_f` rather
+than by hunting for a door mesh.
+
+The one genuine exception is the wheel. Wheel geometry lives in the frag
+children, and unlike the body those drawables are authored in **bone-local**
+space — vertices centred on the origin, not out at the hub the file stores them
+against — so each is parented to its bone with no transform of its own, and
+rolling a wheel is a rotation of that bone.
+
+A car ships one wheel drawable and leaves its other three wheel children empty,
+so that mesh is instanced onto every wheel bone. Bikes and six-wheelers ship
+*two*, on `wheel_lf` and `wheel_lr`, because their front and rear wheels are
+genuinely different sizes; each bone takes whichever side of its own axle exists,
+and a six-wheeler's middle axle falls back to the rear wheel it shares a size
+with. Collapsing those into one mesh puts a bike's rear tyre on the front.
+
+That bone-local detail also decides where the vehicle sits. The ground offset
+cannot come from the lowest vertex the way the character's does, because the
+wheel's vertices are in a different space and reach 0.36 m below an origin that
+is not the car's. It is measured instead as the true minimum of each tyre's
+vertices under its own hub bone's world transform — rotation included, which
+matters because a bike's front wheel hangs off a raked fork. On most vehicles
+that contact patch, not the body, is the lowest thing on the model. Exported this
+way every model lands on `y = 0`.
+
+Two details the viewer depends on:
+
+- **Paint is per-instance, not in the texture.** `gta_vehicle_paint*` samples a
+  spec map; the actual colour comes from the model's `carcols.dat` sets, which
+  the catalogue carries as indices into a shared 134-entry palette. Those
+  materials are tagged `extras.paint` so the viewer knows what to tint. Every
+  model has at least one colour set; the Banshee has 24, the police car 1.
+- **Most of the surface is not in the model's own `.wtd`.** `police.wtd` holds
+  three badge and light textures and nothing else; bodywork, glass and interior
+  all resolve out of the shared `vehshare` dictionary. Lookup is model, then
+  `vehshare`/`vehshare_truck`, then the drawable's embedded dictionary. Across
+  all 127 models exactly one texture name fails to resolve — `givemechecker`,
+  which is the game's own checkerboard placeholder.
+
+`handling.dat` and `vehicles.ide` are parsed for the catalogue: mass, gearing,
+top speed, steering lock, spawn frequency and traffic cap. Note that
+`handling.dat` has no drive-type letter anywhere in the row — RWD/FWD/AWD is
+column 7, `fDriveBiasFront`, being 0 / 1 / in between. Seat count is not in
+`handling.dat` either; it comes from counting the skeleton's `seat_*` bones,
+which also gives seat *positions* for free. The counts come out right: the
+Banshee and Infernus two, the Admiral and police car four.
+
+Wheel counts are a free sanity check on the whole pipeline, and they land: 101
+models with four, 7 with two (the bikes), 5 with six (the trucks), 14 with none
+(boats, helicopters, the subway).
+
+`web/vehicles.html` previews the fleet on its own, the way `player.html` does the
+character: pick a model, respray it from its own carcols sets, watch the wheels
+turn. `npm run test:vehicles` drives that page over a spread of the shapes the
+exporter has to get right — a saloon, a supercar, the police car with its seven
+sirens, a bike, a six-wheeled truck and a boat with no wheels at all.
+
+One note on testing ground contact, because both obvious instruments are wrong
+and each is wrong somewhere different. `Box3` transforms a geometry's AABB, so a
+*rotated* node inflates it: a spinning 0.33 m wheel, or a bike's raked fork,
+reports a box reaching 0.14 m under the road while every vertex of it is above
+the road. Reading `geometry.attributes.position` and applying `matrixWorld`
+fixes that for the rigid wheels but is wrong for the body, which is skinned —
+that attribute holds bind-pose vertices and the bones are what place them, so a
+boat's hull reads 0.79 m high. The check parks the wheels and pushes skinned
+vertices through `applyBoneTransform`; every model then measures within 0.2 mm
+of the road.
+
+## The population
+
+`npm run extract:peds` reads `pc/models/cdimages/componentpeds.img` and writes
+one Meshopt-compressed `.glb` per ped into `web/assets/peds/`, plus a shared
+`animations.glb` and a `peds.json` catalogue.
+
+An ambient ped is shaped differently from Niko, whose components are loose
+`.wdr` files in `playerped.rpf`. Here each one is a triple: `<name>.wdd` is a
+pgDictionary of component drawables, `<name>.wft` the skeleton, `<name>.wtd` the
+textures.
+
+The fact the whole design rests on: **every ped shares one skeleton.** All 345
+`.wft` files are between 25,982 and 27,196 bytes, and they agree on all 80 bone
+IDs. So the clip library is exported *once* — 112 clips from `move_m@generic`,
+`move_f@generic` and `move_cop` — into a single `animations.glb` the viewer
+fetches one time and plays on any ped. Embedding clips per ped instead would
+have multiplied about 2 MB by the population and spent the entire budget on
+duplicate walk cycles. To make that work the copies' small disagreements have to
+be ironed out: they differ on a couple of bone *names* (`Char_L_Toe` against
+`Char_L_Toe0`) while agreeing on every BoneID, so node names are taken from one
+reference ped and applied by ID to all of them.
+
+Three things were not what they looked like:
+
+- **Component names are hashes, and the obvious fallback lies.** The dictionary
+  keys are name hashes, reversed by hashing candidate spellings. Where that
+  failed I first read the slot off the shader's texture name instead — which
+  quietly broke peds, because a component can bundle geometry that is not its
+  own slot. `m_y_bronx_01`'s `lowr_000_u` carries two geometries and the *first*
+  is textured `head_diff_000_a_bla`, so the trousers were labelled a head, and
+  they displaced the real head and left the ped headless. The dictionary name is
+  the authority; the texture is only a fallback, and it now takes the slot from
+  the geometry with the most vertices so a small patch cannot outvote the
+  garment it sits on.
+- **Ped texture names are not unique, and deduplicating by name is silently
+  destructive.** Every ped's own `.wtd` calls its shirt `uppr_diff_000_a_uni`,
+  and those are *different images* — verified by comparing bytes. Sharing the
+  map's texture cache would have dressed all 343 in the first ped's clothes, so
+  ped textures live in their own directory, namespaced per ped.
+- **`superlod` is not a ped.** It is the game's 3-vertex stand-in for a body too
+  far away to draw. It, and `m_y_gbik_hi_01` (which ships no `.wtd` of its own),
+  are recorded in the catalogue's `skipped` list rather than silently dropped.
+
+Textures are capped at 256 px on the long edge (`-MaxEdge`), which is a slice of
+the mip chain the game already stored and so costs no re-encode — the same trick
+`tools/pack-textures.mjs` uses on the map. Only the diffuse textures the default
+outfit actually references are written, not all 33 in each `.wtd`.
+
+Each ped exports the lowest-numbered variant of each slot — its default outfit.
+The other variants are listed in the catalogue as `otherVariants` but not
+exported: 343 bodies is already the variety, and shipping every shirt multiplies
+the payload for little visible gain.
+
+The meshopt pass runs one `npx` per ped, so a full population takes roughly half
+an hour. If it is interrupted, `bash tools/compress-peds.sh` picks up from
+whatever is still uncompressed and rewrites the catalogue — re-running
+`npm run extract:peds` instead would re-extract every ped first, making all 343
+`.gltf` files newer than their `.glb` and forcing the whole set through again.
+
+`web/peds.html` previews the population, and `npm run test:peds` drives it over
+a male, a female and two police types — asserting among other things that the
+shared clip library actually moves each ped's own joints, which is what proves
+the canonical BoneID naming holds across the population.
+
+## Traffic
+
+`npm run extract:paths` reads `common/data/maps/paths*.ipl` into
+`web/data/paths.json`, and `web/traffic.js` drives cars along it.
+
+Finding the network took a moment: the `path` section those text IPLs still
+carry is *empty*. The data is in two sections the GTA III-era format never had —
+`vnod` (a vehicle node: x, y, z and a street-name hash) and `link` (a node pair
+plus a lane count). Of the four files, `paths` and `paths2` are the road network
+(24,602 nodes, 24,568 edges, 1,440 junctions, median segment 8 m), `paths3` is
+boat lanes — its Max file is literally `paths3_boats.max` — and `paths4`
+(`Networkpaths_4.max`) has nodes but no links at all, so it is not a graph and is
+skipped. Link indices are per file, so each file is parsed in its own index space
+and offset on concatenation; every one of the 24,568 links resolves and no node
+is left isolated.
+
+**A node chain is one carriageway, not a road centreline.** This is the thing to
+get right and it is not stated anywhere. Sampling 1,446 edges for their nearest
+near-parallel neighbour gives a bimodal distribution with a clear mode at 9-10 m
+— a dual carriageway with a separate chain per direction. So lanes straddle the
+chain rather than sitting off one side of it. Reading the `lanes` column the
+obvious way instead puts the outer lane of a 4-lane road 11.2 m wide of its own
+carriageway, on the pavement. Cars now sit at most 1.6 m off their segment.
+
+Direction is taken from node index order rather than at random, so every car on
+a carriageway flows the same way instead of half of them driving into the other
+half. That is a self-consistent convention, not a claim about the game's intent:
+link columns 5 and 6 carry 0/1/2 and 0..3 with no meaning identified.
+
+Models are drawn by `vehicles.ide`'s own `Frq` weight and capped by its
+`MaxNum`, minus a list of things that are in the catalogue but are not ambient
+traffic — emergency vehicles, the airport and dock plant, rail stock. 95 models
+stay in the rotation; a typical 24-car sample shows about 20 distinct ones. Each
+car takes a colour from its own `carcols` sets, cruises at 34-52 km/h, and rolls
+its wheels from distance travelled rather than at a fixed rate.
+
+Path node heights turn out to be the drivable surface already: probing against
+the streamed city moves a car by a median of 0 and at most 0.15 m, and every car
+measures within 0.1 m of the road. The probe is kept anyway, because those small
+corrections are real and because it keeps cars on the surface over bridges and
+slopes instead of trusting a straight line between two nodes.
+
+A measurement trap worth recording, since it produced a confident wrong answer
+first time round: a downward ray from above a car hits *that car's own bodywork*
+before the road, and reports the surface as ~1.4 m above the wheels — which is
+just the height of a roof. Vehicles are tagged `userData.isVehicle` so a ground
+probe can skip them.
+
+`web/traffic.html` previews the network and the driving with the city replaced
+by a wireframe of the graph, so a failure there is the path data or the driving
+and never sector streaming; `web/index.html` runs the same traffic in the real
+world.
+
+## The pedestrian navmesh
+
+`npm run extract:navmesh` reads `pc/data/cdimages/navmeshes.img` into
+`web/data/navmesh.json` + `navmesh.bin`: **910,402 walkable points in 3.5 MB**,
+from all 3,600 tiles, none skipped.
+
+This is the only source for where a person may stand. `paths*.ipl` is a vehicle
+graph with nothing for peds — GTA IV navigates the crowd on a navmesh instead —
+and RageLib has no reader for `.wnv`, so the format had to be worked out.
+
+`nav.dat` gives the geometry: `SECTORS_PER_NAVMESH=2` over 50 m game sectors, so
+each tile is 100 m. The filenames' indices are sector numbers, which is why they
+are all even, and the 3,600 tiles form a dense 60x60 grid — 6,000 m per axis,
+putting the world origin at -3000. Each tile is an RSC5 container with a zlib
+stream at offset 12:
+
+| offset | meaning |
+| --- | --- |
+| `0x40`, `0x44` | tile size X, Y — always 100 |
+| `0x48` | tile Z extent — varies per tile, 0 to ~215 m |
+| `0x58` / `0x78` | vertex array / count — 6 bytes, 3 x uint16 quantised over the tile |
+| `0x60` / `0x68` | index array / count — uint16 into the vertices |
+| `0x6c` / `0x7c` | polygon array / count — 40 bytes, uint16 at `+4` is its first index |
+
+A polygon's vertex count is the next polygon's first index minus its own, which
+gives 3 to 10.
+
+Three independent checks, because a self-consistent reading of a binary is not
+the same as a correct one:
+
+- Decoded vertices land **0.07-0.72 m** from road-graph nodes in the same tile,
+  which pins the origin, the tile size and the absence of an axis flip.
+- The index array holds **exactly `vertexCount` distinct values with a maximum
+  of `vertexCount - 1`** — it addresses every vertex and nothing else. This is
+  what identified it: three other candidate arrays gave out-of-range indices or
+  polygons whose vertices were scattered across the tile.
+- Across 18 tiles from 67 to 7,121 vertices: no out-of-range index, no
+  degenerate polygon, and a median height spread **within** a polygon of
+  0.00-0.48 m. Navmesh polygons are flat, and wrong indexing cannot produce
+  that.
+
+And the output check: every road node in the city has a walkable point within
+15 m, mean **2.17 m**. Pavement exists beside every road, which is what a ped
+navmesh should say.
+
+**The per-tile Z minimum is not decoded, and is not needed.** The Z extent is
+stored at `0x48` but the base is not, and no float anywhere in a tile's header
+matches the offset measured against real road heights (it varies per tile:
++15.65, -9.14, +0.51, -24.20, +35.29). Heights come from the viewer's own ground
+raycast, which is exact; what the navmesh uniquely provides is the walkable
+footprint in plan.
+
+Points are polygon centroids thinned onto a 2.5 m grid — 1.86 million polygons
+becomes 910 thousand points, about 253 per tile. Full detail is far more than a
+crowd needs and would not fit in a sensible download.
+
+## The crowd
+
+`web/crowd.js` walks peds along the navmesh points, spawned into a ring around
+the player and culled outside a larger one, the same population model the
+traffic uses. `web/nav-points.js` holds the walkable set and answers "what is
+near here" and "where can this ped step next".
+
+Two things about it are worth knowing, because both were bugs first.
+
+**Clips are namespaced by their source wad.** `move_m@generic`, `move_f@generic`
+and `move_cop` share **50 clip names** between them — `walk`, `run` and `idle`
+among them — so a flat library silently resolves `walk` to whichever wad loaded
+first, and the entire female population inherits the male gait. Clips are now
+`m@generic/walk`, `f@generic/walk`, `cop/walk`, and the test asserts that each
+ped is playing a clip from its own set rather than merely playing something.
+
+**The reference skeleton is chosen before any filter.** Bone names are stamped
+from one reference ped onto every ped and onto the clip library. Re-exporting
+*just* the clips with a ped filter picked a different reference, and since peds
+disagree on two bone names (`Char_L_Toe` against `Char_L_Toe0`, same BoneID) the
+library came back with tracks for bones the population does not have — visible
+only as a `THREE.PropertyBinding` warning and two dead toes.
+
+Heights come from the same ground probe the traffic uses, since the navmesh has
+none. Peds are probed once at spawn — before they are ever shown, and the spawn
+is abandoned if nothing is under it — because unlike traffic there is no node
+height to fall back on, and an unprobed ped stands at `y = 0`, which in this city
+is anywhere from a basement to a rooftop away. While walking, the probe eases
+over gentle ground and snaps across anything abrupt: easing everything leaves a
+ped hanging a metre off the pavement for about a second after a kerb.
+
+Measured in the streamed city: 18 peds, 17 distinct models, both locomotion sets
+in use, every ped within **0.14 m** of the ground and **2.2 m** of a walkable
+point.
+
+## The wanted system
+
+`web/wanted.js` keeps the level, `web/police.js` is the response to it. Six
+stars, shown top right, dimmed once nothing has eyes on the player.
+
+It follows IV rather than the older games in two ways that shaped the code.
+Heat is continuous and stars are a *display* of it, so a second offence while
+already wanted escalates smoothly instead of snapping. And a level does not
+simply time out: cooling only begins once nothing has seen the player for a
+grace period, any sighting resets it, and higher levels resist cooling — six
+stars is a different problem from one.
+
+Offences are priced in `CRIMES`; killing an officer costs nearly three times a
+civilian, and an unwitnessed crime costs about a third of a witnessed one.
+`wanted.response` is the single place difficulty lives — officers, cruisers,
+spawn radius, pursuit speed and when the heavier units arrive — and `police.js`
+only reads it.
+
+The response uses exactly the units the ambient systems hold back: `traffic.js`
+keeps `police`/`police2`/`noose`/`fbi` out of its rotation and `crowd.js` keeps
+the cop peds out of its own, so they appear only because of a wanted level.
+Officers run the navmesh greedily toward the player and cruisers drive the road
+graph the same way — not planned routes, because a chase does not need A* over
+910,000 points to read correctly. Officers use the `cop/*` locomotion set from
+`move_cop.wad`, falling back to the male generic set for anything those six
+clips lack.
+
+Two things the tests caught:
+
+- **In-flight spawns must count against the cap.** Two loads can be in the air
+  while the list is still short, and four cruisers turn up for a three-cruiser
+  level. Units are also shed — furthest first — when the level falls, so the
+  response thins from the edges instead of vanishing from under the player.
+- **A ground probe must prefer the surface nearest the unit, not the topmost.**
+  The navmesh points carry no height, so a point on a bridge and one on the
+  street beneath it are the same point in plan; taking the first ray hit drops
+  a ped off the bridge. This is the one place where not decoding the per-tile Z
+  base is felt, and it is why `test:crowd` asserts a tight *median* grounding
+  error with a looser worst case: a ped crossing between levels can be briefly
+  wrong by about a storey, and only a systematic break moves the median.
+
+`G` attacks the nearest pedestrian — the viewer has no weapons, so it stands in
+for the offence itself: the ped is removed and the crime reported, witnessed if
+anything is close enough to see it. `gta4map.reportCrime()` and
+`gta4map.clearWanted()` drive the same paths from the console.
+
+## Driving
+
+`E` gets into the nearest car and out again. `web/driving.js` handles it, with a
+chase camera that sits in the car's frame rather than the mouse's, so the view
+leads through a corner.
+
+The handling is an arcade model — there is no suspension, no weight transfer and
+no tyre model, because GTA IV's real handling lives in RAGE's solver and the
+archives carry the tuning, not the solver. But the *constants* are not invented:
+mass, drive force, top speed, brake force and steering lock all come from the
+catalogue, which read them from the game's own `handling.dat`. So an Infernus
+pulls away from a Taxi and a Trashmaster corners like a Trashmaster without
+anything in the module knowing which is which. The steering lock also tightens
+with speed, which is the cheapest thing that stops a car pivoting on the spot at
+100 km/h, and the front wheel bones are steered as well as rolled.
+
+Getting in takes the car **out of traffic and keeps the same object**, so its
+paint, its wheels and its position carry straight across rather than being
+swapped for a freshly loaded copy — the test asserts the traffic count drops by
+exactly one. Getting out puts the player beside the driver's door, using the
+model's own `seat_dside_f` bone to decide how far, and hands the car back so it
+rejoins the flow instead of standing abandoned.
+
+Running someone down is `ranOverPed`, and it only counts above 12 km/h — a
+stationary car resting against somebody is not the same offence.
+
+Two ordering traps worth recording:
+
+- **`setMode('walk')` seeds the player from the camera**, so the exit point has
+  to be applied *after* the mode switch or it is immediately overwritten and the
+  player steps out wherever the lens happened to be.
+- **Speed alone cannot tell braking from reversing.** Pressing back from a
+  standstill is a gear change, and an absolute speed reads that as accelerating.
+  The state exposes a signed `velocityKmh` for exactly this reason; the first
+  version of the test failed on it.
+
+Not done: Niko is hidden while driving rather than seated. The seat bones say
+where he should sit, but posing him needs a sitting clip, and those live in the
+`amb@car_std_*` family rather than the movement wads the ped library was built
+from.
+
+## Weapons and combat
+
+`npm run extract:weapons` pulls three weapons out of
+`pc/models/cdimages/weapons.img` — `w_glock`, `w_m4` and `rpg` — and everything
+about how they behave out of `common/data/WeaponInfo.xml`. `1`, `2` and `3`
+draw them, `0` holsters, click fires, `R` reloads.
+
+Nothing about their behaviour is invented. The file says the pistol does 25
+damage from a 17-round magazine every 333 ms out to 50 m; the M4 does 30 from 30
+rounds every 120 ms out to 70 m; the launcher is a single-shot `PROJECTILE` with
+an `EXPLOSIVE` damage type on an 800 ms cycle. All of that is read straight
+across, which is why the M4 both outranges and outshoots the pistol without
+anything in the code saying so.
+
+The animations are the game's too. `gun@handgun`, `gun@rifle` and `gun@rocket`
+carry the real `fire`, `reload`, `holster` and `unholster` clips, and
+`move_rifle`/`move_rpg` are the armed walk cycles — 141 clips, exported against
+Niko's own skeleton into `weaponclips.glb` (2.3 MB) so `player.gltf` stays the
+size it was. All three gun sets name their clips identically, so they are
+namespaced by set exactly as the ped library is; without that every weapon would
+play the handgun's animation.
+
+Hits are resolved against ped **positions**, not by raycasting their meshes: a
+ped is a skinned mesh whose bounding volume is the bind pose, so mesh
+raycasting is both expensive and wrong mid-stride. A capsule round the spine is
+what the shot is aimed at anyway. The launcher instead throws the game's own
+`cj_rpg_rocket`, which flies until it meets a target, the ground or its 100 m
+range and then takes out everything within nine metres.
+
+Two bugs worth recording, both of which looked fine until measured:
+
+- **Damage was keyed on rounded position.** A walking ped therefore got a fresh
+  100 health every few centimetres and could not be shot dead. Peds and police
+  units now carry a stable id for their lifetime, and health is keyed on that.
+- **That health map was a `WeakMap`.** It cannot take string keys — it throws —
+  so damage tracking would have failed outright the first time anything was hit.
+
+### Upper-body layering
+
+Shooting while running is two layers, not one clip.
+
+The **base** is full-body locomotion, and when a rifle or launcher is out it is
+the game's own armed locomotion — `move_rifle/*` or `move_rpg/*`, which ship
+complete idle/walk/run/sprint sets. A pistol keeps the ordinary walk, as it does
+in GTA IV. The **layer** on top is the `gun@` clip, restricted to the bones from
+`Char_Spine` up and played in `AdditiveAnimationBlendMode`.
+
+Both halves of that are load-bearing:
+
+- **Restricted to the upper body**, or the gun clip's own stance fights the
+  stride and the legs stop running.
+- **Additive**, because three.js *averages* two normal actions that drive the
+  same bone. A full-weight fire clip over a full-weight run does not put one on
+  top of the other, it gives a half-hearted blend of both.
+
+The additive delta is computed here rather than with
+`AnimationUtils.makeClipAdditive`, which pairs target and reference tracks **by
+index** — an assumption that does not survive dropping the lower-body tracks.
+The reference is the bind pose, captured at attach time before anything has
+animated, so the layer is "weapon pose minus rest" and adding it to any stride
+raises the arms into the aim.
+
+Measured, with the base clip held constant so only the layer changes: firing
+turns the arms 0.50-1.15 rad and the legs 0.04-0.06 rad, and the residue on the
+legs is the base cycle advancing during the sample rather than leakage.
+`artifacts/run-and-fire.png` is the same thing to look at: `gta4map.setPaused(true)`
+freezes the simulation mid-sprint while rendering carries on, so the camera can
+be walked round a held pose — legs in a full stride, rifle shouldered. Getting
+that experiment right mattered — comparing armed against unarmed instead also
+swaps `move_rifle/run` in for `run`, and the legs then differ by 1.58 rad for
+reasons that have nothing to do with the layer.
+
+The one part of the weapon setup NOT taken from the game is where each weapon
+sits in the hand: GTA IV keeps attachment transforms in data this project does
+not read, so those five numbers per weapon are tuned by eye.
+
 ## Walk mode
 
 Walk mode drives Niko and follows him in third person:
@@ -187,8 +652,21 @@ character who runs sideways.
 npm test                        # browser smoke test -> artifacts/*.png
 npm run test:player             # character on its own -> artifacts/player-*.png
 npm run test:walk               # walk mode in the streamed world
+npm run test:vehicles           # fleet sample -> artifacts/vehicle-*.png
+npm run test:peds               # population sample -> artifacts/ped-*.png
+npm run test:traffic            # road graph + driving, without the city
+npm run test:world-traffic      # traffic in the streamed city -> artifacts/world-traffic.png
+npm run test:crowd              # the crowd on the navmesh -> artifacts/crowd.png
+npm run test:wanted             # stars + police response -> artifacts/wanted.png
+npm run test:driving            # taking a car and driving it -> artifacts/driving.png
+npm run test:weapons            # the three weapons and combat -> artifacts/weapons.png
 node test/probe-white.mjs       # per-pixel material/texture audit of the view
 node test/timecyc-shots.mjs     # one frame per keyframe -> artifacts/timecyc/
 node test/baked-ab.mjs          # COLOR_0 lighting on/off -> artifacts/baked/
 node test/grade-depth.mjs       # asserts the grade's near/far split reads depth
+
+`gta4map.setPaused(true)` stops the simulation without stopping the renderer,
+and `gta4map.lookAtPoint(x, y, z, [dx, dy, dz])` puts the camera anywhere while
+it is stopped. Between them any moment can be held still and photographed from
+any angle, which is the only practical way to catch a pose mid-stride.
 ```
