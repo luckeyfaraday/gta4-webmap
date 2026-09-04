@@ -1,4 +1,7 @@
-# GTA IV browser map prototype
+# Liberty City browser map
+
+An experimental, local-only Three.js viewer and extraction pipeline for Grand
+Theft Auto IV: The Complete Edition.
 
 This project reads the installed GTA IV archives locally and exports the complete
 outdoor Liberty City map — 34 sectors across Manhattan, Broker/Dukes/Bohan and
@@ -8,6 +11,16 @@ animations. The city's cast is exported too: all 127 traffic vehicles, and 343
 ambient peds driven by one shared library of 112 locomotion clips. Rockstar
 assets remain local and are not included in the source code.
 
+> [!IMPORTANT]
+> This repository contains source code only. It does not include or download
+> GTA IV game files. You must own and supply a legally installed copy of GTA IV:
+> The Complete Edition. Do not commit or redistribute generated files from
+> `web/assets/` or `web/data/`.
+
+This is an unofficial fan project and is not affiliated with or endorsed by
+Rockstar Games or Take-Two Interactive. Grand Theft Auto, GTA IV, Liberty City,
+and related names are trademarks of their respective owners.
+
 | | models | payload |
 | --- | --- | --- |
 | map | 34 sectors | see Rendering |
@@ -15,15 +28,48 @@ assets remain local and are not included in the source code.
 | vehicles | 127 | 19 MB |
 | peds | 343, 112 shared clips | 30 MB + 51 MB textures |
 
-## Run
+## Requirements
+
+- Windows 10 or 11 with Windows PowerShell
+- A legally installed copy of GTA IV: The Complete Edition
+- Git
+- Node.js 22 or newer
+- .NET SDK 8, or permission for the setup script to install a repository-local
+  copy
+- Chrome or Edge for the browser checks
+
+The repository must be cloned directly inside the game installation. The
+extractors intentionally resolve the parent directory as the game root:
+
+```text
+Grand Theft Auto IV - The Complete Edition/
+├── GTAIV.exe
+├── pc/
+└── _webmap/       # this repository
+```
+
+## Setup
+
+From the repository directory, install the JavaScript dependencies, fetch the
+pinned GTA4Unity/RageLib source dependency, and install .NET locally when it is
+not already available:
 
 ```powershell
-cd "C:\Games\Grand Theft Auto IV - The Complete Edition\_webmap"
-npm install
+./setup.ps1
+```
+
+The generated game assets are intentionally absent from a fresh clone. Build
+them locally, then start the static server:
+
+```powershell
+npm run extract:world
 npm run serve
 ```
 
 Open <http://127.0.0.1:4174>.
+
+Generated assets can take several gigabytes. They and all other game-derived
+data are ignored by Git.
 
 ## Rebuild the map
 
@@ -706,6 +752,19 @@ The one calibration constant is `MODEL_YAW_OFFSET`: which way the bind pose
 faces. `getState().player.facing` derives the real facing from the eye joints so
 `npm run test:walk` fails if that constant is ever wrong, rather than leaving a
 character who runs sideways.
+
+## Third-party code and licensing
+
+The extractor builds against RageLib sources from the
+[GTA4Unity project](https://github.com/Infinity-Loops/GTA4Unity), pinned by
+`setup.ps1` and CI to a known revision. GTA4Unity/RageLib is licensed under the
+GNU General Public License version 3; its checkout stays separate in the ignored
+`converter/` directory.
+
+This repository does not yet declare a project-wide license. Until the
+copyright holders add one, default copyright rules apply to this repository's
+original source. Publishing the repository makes the code visible but does not
+by itself grant permission to copy, modify, or redistribute it.
 
 ## Checks
 

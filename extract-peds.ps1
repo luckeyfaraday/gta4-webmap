@@ -38,7 +38,7 @@ try {
             continue
         }
         Write-Host "[$index/$($targets.Count)] Compressing $name"
-        npx --yes '@gltf-transform/cli@4.4.2' optimize `
+        npx --no-install gltf-transform optimize `
             "web/assets/peds/$name.gltf" "web/assets/peds/$name.glb" `
             --compress meshopt --flatten false --join false --instance false `
             --palette false --simplify false --texture-compress false

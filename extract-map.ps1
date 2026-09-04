@@ -14,7 +14,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Push-Location $root
 try {
-    npx --yes '@gltf-transform/cli@4.4.2' optimize `
+    npx --no-install gltf-transform optimize `
         'web/assets/manhat01/map.gltf' 'web/assets/manhat01/map_optimized.glb' `
         --compress meshopt --flatten false --join false --instance true `
         --instance-min 2 --palette false --simplify false --texture-compress false

@@ -39,7 +39,7 @@ foreach ($sector in $sectors) {
 
     Push-Location $root
     try {
-        npx --yes '@gltf-transform/cli@4.4.2' optimize `
+        npx --no-install gltf-transform optimize `
             "web/assets/sectors/$($sector.Name)/map.gltf" "web/assets/sectors/$($sector.Name)/map_optimized.glb" `
             --compress meshopt --flatten false --join false --instance true `
             --instance-min 2 --palette false --simplify false --texture-compress false

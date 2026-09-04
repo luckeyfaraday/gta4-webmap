@@ -9,6 +9,19 @@ extractor/obj/
 .dotnet/
 artifacts/
 .claude/worktrees/
+*.log
+coverage/
+
+# Local configuration and editor/OS metadata
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.suo
+*.user
 
 # Vendored IV-Unity converter: an upstream checkout with its own git history.
 # RageLib under converter/Assets/Scripts is compiled into the extractor by
@@ -19,3 +32,6 @@ converter/
 # road graph and the ped navmesh. Rockstar data, so it stays local like
 # web/assets.
 web/data/
+
+# Downloaded on demand by install-dotnet.ps1.
+dotnet-install.ps1

@@ -39,7 +39,7 @@ try {
             continue
         }
         Write-Host "[$index/$($manifest.vehicles.Count)] Compressing $($vehicle.model)"
-        npx --yes '@gltf-transform/cli@4.4.2' optimize `
+        npx --no-install gltf-transform optimize `
             "web/assets/vehicles/$($vehicle.model).gltf" "web/assets/vehicles/$($vehicle.model).glb" `
             --compress meshopt --flatten false --join false --instance false `
             --palette false --simplify false --texture-compress false

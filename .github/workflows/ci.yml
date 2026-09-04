@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Check out the pinned RageLib source
+        shell: pwsh
+        run: |
+          git clone https://github.com/Infinity-Loops/GTA4Unity.git converter
+          git -C converter checkout --detach c107e46cf8ab4e3d42f9c0bf685f80bb732a3609
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: 8.0.x
+
+      - run: npm ci
+      - run: npm audit --audit-level=high
+      - run: npm run check
+      - run: dotnet build extractor/Gta4MapExtractor.csproj --configuration Release --nologo
