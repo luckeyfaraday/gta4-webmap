@@ -88,12 +88,12 @@ HUD toggle flipping a couple of dozen materials instead of several thousand.
 
 ```powershell
 npm run extract:timecyc   # pc/data/timecyc.dat -> web/data/timecyc.json
+npm run extract:sky       # pc/textures/skydome.wtd -> web/assets/sky/
 ```
 
 The viewer is lit from the game's own timecycle: 9 weathers x 11 keyframes,
 interpolated for the current hour to drive the ambient pair (Amb0/Amb1), the
-sun (Dir), fog, the sky gradient and exposure. Time and weather
-are on the HUD panel.
+sun (Dir), fog, the sky and exposure. Time and weather are on the HUD panel.
 
 The sun's direction is reconstructed, because timecyc.dat does not store it: an
 arc whose sunrise and sunset come from the SunMult column, which holds at 13
@@ -102,8 +102,63 @@ day/night brightness ratio is reconstructed too; see the Exposure note below.
 
 FogSt is parsed but not used as a fog start distance — FOGGY sits at 73-79
 while SUNNY drops to 9, so it cannot mean that. Fog is exponential, tuned to
-reach FarClp, and dimmed relative to the sky it is sampled from: SkyLightMult
-runs to 4x AmbLightMult0, and haze at full sky radiance washes the city out.
+reach FarClp, and its colour is the dome's own gradient evaluated at the
+horizon, averaged across the east and west ends so it holds whichever way the
+camera faces.
+
+### The sky
+
+The sky is not reconstructed. GTA IV draws it with `gta_atmoscatt_clouds`, and
+`common/shaders/dcl` ships that shader's assembly with every constant named, so
+`web/lighting.js` is a transcription of the game's own sky maths. Reading the
+vertex shader's last dozen instructions gives the gradient exactly:
+
+```
+azimuth = (1 - saturate(dir.y * AzimuthHeight)) * AzimuthStrength
+sky     = SkyColor + azimuth * mix(AzimuthColorEast, AzimuthColor, dir.x * 0.5 + 0.5)
+```
+
+Two things fall out of that which no amount of eyeballing would have found. The
+horizon colour is **added** to the zenith colour rather than crossfaded with it,
+so SkyColor is the whole dome's floor and the azimuth term is a glow laid over
+it. And the horizon is **two** colours split east/west, which is what paints the
+warm side of a sunrise without tinting the entire sky.
+
+Naming the shader's constants also turns "what is column 64" into "which
+constant does column 64 behave like", which the data can answer. timecyc.dat's
+header leaves columns 63-119 unnamed; `tools/parse-timecyc.mjs` now names nine
+of them and records the evidence for each. The strongest:
+
+| column | constant | why |
+| --- | --- | --- |
+| 64-66 | SkyColor | goes flat grey in RAIN and blue in EXTRASUNNY |
+| 67-69, 70-72 | AzimuthColor, AzimuthColorEast | bit-identical at 9AM and 6PM, split warm/cool at 6AM and 7PM |
+| 73-75 | SunsetColor | (1.000, 0.882, 0.588) in exactly the keyframes either side of the sun, muted grey in every other |
+| 63 | AzimuthStrength | 1.389 under a clear midnight — the city lighting its own haze |
+| 88, 89 | CloudInscatteringRange, CloudEdgeSmooth | 0.680 and 0.757 against visualSettings.dat's 0.68 and 0.76 |
+| 116-117 | SunCentre start/end | 0.980 and 1.000, exactly visualSettings.dat's sky.sun.centreStart/End |
+
+The columns the header *does* name were the wrong ones: "Sky top" is `0 0 0` at
+9AM, so the old two-stop dome was built on a black zenith and had to be lifted
+with Amb0 to look like anything.
+
+`npm run extract:sky` unpacks `pc/textures/skydome.wtd`, which is where the sky's
+own textures live — a three-channel Perlin lattice and a detail bump for the
+clouds, plus a starfield and a galaxy band for the night. The clouds are that
+lattice summed as three octaves (sampled flat it is either two magnified blobs
+or a field of speckle), thresholded by CloudAlpha — a 0-255 byte that reads 0
+under a clear midnight and 217 when DRIZZLE is overcast — and coloured by the
+LowCloudsRGB/BottomCloudRGB pair the header does name. The dictionary also holds
+`moon.dds` and `moonglow.dds`, which nothing draws yet.
+
+Two things about brightness are worth writing down, because both produced a
+flat, blown-out sky before they were understood. SkyLightMult does not scale the
+dome — it is how much light the sky casts on the city, not how brightly the dome
+draws, which is what the shader's separate HDRExposure is for. And the dome does
+not ride the scene exposure either: that exposure is the reciprocal of
+AmbLightMult0, so at 6AM it climbs to 0.77 and rendered a dawn sky 2.8x brighter
+than midday's. Dividing it back out leaves the dome's brightness as SkyColor
+times one constant in every keyframe.
 
 ### Colour grade
 
@@ -132,13 +187,19 @@ frame's ambient contribution at an explicit key instead, which cancels Exposure
 out of the arithmetic and is stable across weathers.
 
 Still on the renderer, not yet done: cascaded sun shadows, normal and specular
-maps, the `gta_emissivenight*` shaders that light the windows after dark, and the
-2dfx coronas. Until those exist the night key is lifted above what the data
-implies, because Amb0 is the only thing lighting the city after dark.
+maps, the `gta_emissivenight*` shaders that light the windows after dark, the
+2dfx coronas, and the moon. Until those exist the night key is lifted above what
+the data implies, because Amb0 is the only thing lighting the city after dark.
 
-Known soft spot: the 7AM/9AM keyframes give a strongly green-tinted haze. Those
-sit in the sky model - Sky top is near black in every keyframe and Sky bot is the
-only usable horizon colour - which is the least certain part of the reconstruction.
+Still inferred in the sky, and marked as such in the source: AzimuthHeight is not
+a column at all — it wants 1.0, and columns 79 and 93 both hold 1.000 in all 99
+keyframes, so either could be it. How far SunsetColor spreads either side of the
+sun is a viewer-side choice; the file says which colour and when, but not how
+wide. StarFieldBrightness could not be pinned to a column with any confidence, so
+the stars fade on sun elevation instead. And the column the header calls SunCore
+cannot be the sun's disc — it is a saturated blue or cyan in every daylight
+keyframe, while SunCorona is the one that goes white as the sun comes up — so
+both the disc and its halo are drawn in SunCorona.
 
 ## The player character
 

@@ -7,6 +7,7 @@
     "extract": "powershell -NoProfile -ExecutionPolicy Bypass -File ./extract-map.ps1",
     "extract:world": "powershell -NoProfile -ExecutionPolicy Bypass -File ./extract-world.ps1",
     "extract:timecyc": "node ./tools/parse-timecyc.mjs",
+    "extract:sky": "node -e \"require('child_process').execFileSync(require('fs').existsSync('.dotnet/dotnet.exe')?'.dotnet/dotnet.exe':'dotnet',['extractor/bin/Release/net8.0/Gta4MapExtractor.dll','--dump-txd','..','pc/textures/skydome.wtd','web/assets/sky'],{stdio:'inherit'})\"",
     "extract:paths": "node ./tools/parse-paths.mjs",
     "extract:navmesh": "node -e \"require('child_process').execFileSync(require('fs').existsSync('.dotnet/dotnet.exe')?'.dotnet/dotnet.exe':'dotnet',['extractor/bin/Release/net8.0/Gta4MapExtractor.dll','--extract-navmesh','..','web/data/navmesh.json','2.5'],{stdio:'inherit'})\"",
     "extract:player": "powershell -NoProfile -ExecutionPolicy Bypass -File ./extract-player.ps1",

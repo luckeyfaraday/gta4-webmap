@@ -153,6 +153,33 @@ if (args.Length >= 5 && args[0].Equals("--dump-file", StringComparison.OrdinalIg
     return 0;
 }
 
+if (args.Length >= 4 && args[0].Equals("--dump-txd", StringComparison.OrdinalIgnoreCase))
+{
+    // --dump-txd <gameDir> <relative .wtd path> <outputDir>
+    // The sky textures live in the loose pc/textures/skydome.wtd rather than in
+    // any .img, so this opens a dictionary straight off disk and writes every
+    // texture out. DDS always (it is the stored mip chain, byte for byte); PNG
+    // as well for the uncompressed formats WritePng understands.
+    var txdGame = Path.GetFullPath(args[1]);
+    var txdPath = Path.Combine(txdGame, args[2].Replace('/', Path.DirectorySeparatorChar));
+    var txdOut = Path.GetFullPath(args[3]);
+    var txdKey = new KeyUtilGTAIV().FindKey(txdGame);
+    if (txdKey == null) throw new InvalidOperationException("Could not locate GTA IV archive key in GTAIV.exe");
+    KeyStore.SetKeyLoader(() => txdKey);
+    Directory.CreateDirectory(txdOut);
+    using var txdFile = new TextureFile();
+    using (var txdStream = System.IO.File.OpenRead(txdPath)) txdFile.Open(txdStream);
+    foreach (var texture in txdFile.Textures)
+    {
+        var txdName = SafeName(CanonicalTextureName(texture.Name));
+        WriteDds(Path.Combine(txdOut, txdName + ".dds"), texture);
+        var plain = texture.Format == D3DFormat.A8R8G8B8 || texture.Format == D3DFormat.L8;
+        if (plain) WritePng(Path.Combine(txdOut, txdName + ".png"), texture);
+        Console.WriteLine($"{texture.Name}\t{texture.Width}x{texture.Height}\t{texture.Format}\t{texture.Levels} levels{(plain ? "\t+png" : "")}");
+    }
+    return 0;
+}
+
 if (args.Length >= 3 && args[0].Equals("--list-archive", StringComparison.OrdinalIgnoreCase))
 {
     // Diagnostic: names, extensions and sizes inside one .img/.rpf, so a new
