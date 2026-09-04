@@ -716,10 +716,20 @@ function updateFollowCamera() {
   camera.lookAt(focus);
 }
 
+// Overview frames the city against the sky rather than straight down onto it.
+// The old offset put the camera 230 up and 260 out, a 41 degree downward pitch
+// that pushed the whole dome above the frame - the sky only showed if you
+// dragged up, which is a poor default now that the dome is drawn from the
+// game's own sky shader. Aiming at a point above the sector centre instead of
+// at the centre itself shallows the pitch to about 17 degrees, which puts the
+// horizon a little under a quarter of the way down the frame.
+const OVERVIEW_EYE = new THREE.Vector3(0, 210, 470);
+const OVERVIEW_AIM = new THREE.Vector3(0, 70, 0);
+
 function teleport(sector) {
   const center = centerOf(sector);
-  camera.position.copy(center).add(new THREE.Vector3(0, 230, 260));
-  orbit.target.copy(center);
+  camera.position.copy(center).add(OVERVIEW_EYE);
+  orbit.target.copy(center).add(OVERVIEW_AIM);
   orbit.update();
   player.position.copy(center);
   verticalVelocity = 0;
