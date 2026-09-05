@@ -1,5 +1,8 @@
 # Liberty City browser map
 
+[![CI](https://github.com/luckeyfaraday/gta4-webmap/actions/workflows/ci.yml/badge.svg)](https://github.com/luckeyfaraday/gta4-webmap/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/code-MIT-7fffc4.svg)](LICENSE)
+
 An experimental, local-only Three.js viewer and extraction pipeline for Grand
 Theft Auto IV: The Complete Edition.
 
@@ -12,14 +15,28 @@ ambient peds driven by one shared library of 112 locomotion clips. Rockstar
 assets remain local and are not included in the source code.
 
 > [!IMPORTANT]
-> This repository contains source code only. It does not include or download
-> GTA IV game files. You must own and supply a legally installed copy of GTA IV:
-> The Complete Edition. Do not commit or redistribute generated files from
-> `web/assets/` or `web/data/`.
+> This is an unofficial, non-commercial fan project. It is not affiliated with,
+> endorsed by, or sponsored by Rockstar Games or Take-Two Interactive. The MIT
+> license covers the project's original code and documentation only. This
+> repository does not include or download GTA IV game files. You must own and
+> supply a legally installed copy of GTA IV: The Complete Edition. Do not
+> commit or redistribute generated files from `web/assets/` or `web/data/`.
+> See [Asset rights](ASSET_NOTICE.md).
 
-This is an unofficial fan project and is not affiliated with or endorsed by
-Rockstar Games or Take-Two Interactive. Grand Theft Auto, GTA IV, Liberty City,
-and related names are trademarks of their respective owners.
+## Give a shout-out
+
+If you use this code, learn from it, stream it, or build something with it,
+please shout out **[Luckey Faraday (@luckeyfaraday)](https://github.com/luckeyfaraday)**
+and link back to this repository. That credit is sincerely appreciated and
+helps people find the original project. The request is not an extra restriction
+on the MIT license; the license's copyright and permission notice still needs
+to be preserved in copies or substantial portions of the code. GitHub's
+**Cite this repository** control is configured through [CITATION.cff](CITATION.cff).
+
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before
+opening a pull request, use the issue templates for bugs and ideas, and follow
+the [Code of Conduct](CODE_OF_CONDUCT.md). Security reports should follow
+[SECURITY.md](SECURITY.md), not a public issue.
 
 | | models | payload |
 | --- | --- | --- |
@@ -755,16 +772,15 @@ character who runs sideways.
 
 ## Third-party code and licensing
 
+Original source and documentation in this repository are licensed under the
+[MIT License](LICENSE). That license does not cover Grand Theft Auto IV game
+files or anything derived from them; see [ASSET_NOTICE.md](ASSET_NOTICE.md).
+
 The extractor builds against RageLib sources from the
 [GTA4Unity project](https://github.com/Infinity-Loops/GTA4Unity), pinned by
 `setup.ps1` and CI to a known revision. GTA4Unity/RageLib is licensed under the
 GNU General Public License version 3; its checkout stays separate in the ignored
 `converter/` directory.
-
-This repository does not yet declare a project-wide license. Until the
-copyright holders add one, default copyright rules apply to this repository's
-original source. Publishing the repository makes the code visible but does not
-by itself grant permission to copy, modify, or redistribute it.
 
 ## Checks
 

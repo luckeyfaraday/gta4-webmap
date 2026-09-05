@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use this project, please cite it and shout out @luckeyfaraday."
+title: "Liberty City browser map"
+type: software
+authors:
+  - family-names: Faraday
+    given-names: Luckey
+    alias: luckeyfaraday
+repository-code: "https://github.com/luckeyfaraday/gta4-webmap"
+license: MIT
+version: 1.0.0
+date-released: 2026-09-05
