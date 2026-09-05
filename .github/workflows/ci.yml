@@ -25,7 +25,7 @@ jobs:
           git clone https://github.com/Infinity-Loops/GTA4Unity.git converter
           git -C converter checkout --detach c107e46cf8ab4e3d42f9c0bf685f80bb732a3609
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           package-manager-cache: false
