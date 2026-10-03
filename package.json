@@ -33,7 +33,7 @@
     "test:walk": "node ./test/walk.mjs"
   },
   "dependencies": {
-    "three": "0.185.1"
+    "three": "0.186.1"
   },
   "devDependencies": {
     "@gltf-transform/cli": "4.5.0",
